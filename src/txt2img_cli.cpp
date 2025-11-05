@@ -5,6 +5,7 @@
 #include <chrono>
 #include <ctime>
 #include <string>
+#include <random>
 
 int main()
 {
@@ -24,10 +25,23 @@ int main()
     float cfg_scale = 7.5f;
     int width = 512;
     int height = 512;
-    int64_t seed = 42;
+    
+    // Seed configuration
+    bool use_random_seed = true;  // Set to true for random seed each run
+    int64_t seed = 42;              // Fixed seed (used when use_random_seed = false)
+    
+    // Generate random seed if requested
+    if (use_random_seed) {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<int64_t> dis(0, INT64_MAX);
+        seed = dis(gen);
+    }
     
     std::cout << "Prompt: " << prompt << std::endl;
     std::cout << "Model: " << model_path << std::endl;
+    std::cout << "Seed: " << seed << (use_random_seed ? " (random)" : " (fixed)") << std::endl;
+    std::cout << "Steps: " << sample_steps << ", CFG Scale: " << cfg_scale << std::endl;
     
     // Initialize context parameters
     sd_ctx_params_t ctx_params;
@@ -97,6 +111,7 @@ int main()
                       results[0].channel, results[0].data, 100);
         
         std::cout << "Images saved: " << png_file_path << " and " << jpg_file_path << std::endl;
+        std::cout << "Used seed: " << seed << " (use this seed to reproduce the image)" << std::endl;
         
         // Free image data
         free(results[0].data);

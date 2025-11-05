@@ -24,6 +24,7 @@
 #include <sstream>
 #include <iomanip>
 #include <filesystem>
+#include <random>
 
 sg_pass_action pass_action{};
 
@@ -36,6 +37,7 @@ struct AppState {
     float guidanceScale = 7.5f;
     int nThreads = -1;  // -1 = auto-detect
     int64_t seed = 42;
+    bool useRandomSeed = false;  // Use random seed for each generation
     bool enableStepPreview = false;  // Enable step-by-step preview (slower)
     int previewInterval = 5;  // Preview every N steps
     bool realTimePreview = false;  // True real-time preview (VERY slow!)
@@ -63,6 +65,7 @@ struct AppState {
     // Save state
     std::string lastPrompt = "";
     std::string lastNegativePrompt = "";
+    int64_t lastUsedSeed = 0;  // Store the actual seed used in last generation
     
     // Thread
     std::thread* generationThread = nullptr;
@@ -170,6 +173,7 @@ void generateImage() {
         float cfg_scale;
         int n_threads;
         int64_t seed;
+        bool useRandomSeed;
         bool enableStepPreview;
         int previewInterval;
         bool realTimePreview;
@@ -184,9 +188,18 @@ void generateImage() {
             cfg_scale = appState.guidanceScale;
             n_threads = appState.nThreads;
             seed = appState.seed;
+            useRandomSeed = appState.useRandomSeed;
             enableStepPreview = appState.enableStepPreview;
             previewInterval = appState.previewInterval;
             realTimePreview = appState.realTimePreview;
+        }
+        
+        // Generate random seed if requested
+        if (useRandomSeed) {
+            std::random_device rd;
+            std::mt19937_64 gen(rd());
+            std::uniform_int_distribution<int64_t> dis(0, INT64_MAX);
+            seed = dis(gen);
         }
         
         // Load model if not loaded or if model path changed
@@ -357,6 +370,7 @@ void generateImage() {
                 std::lock_guard<std::mutex> lock(appState.dataMutex);
                 appState.lastPrompt = prompt;
                 appState.lastNegativePrompt = negativePrompt;
+                appState.lastUsedSeed = seed;
                 
                 char timeStr[64];
                 snprintf(timeStr, sizeof(timeStr), "%.2fs", milliseconds / 1000.0f);
@@ -415,6 +429,7 @@ void generateImage() {
                     appState.hasNewImage = true;
                     appState.lastPrompt = prompt;
                     appState.lastNegativePrompt = negativePrompt;
+                    appState.lastUsedSeed = seed;
                     
                     char timeStr[64];
                     snprintf(timeStr, sizeof(timeStr), "%.2fs", milliseconds / 1000.0f);
@@ -545,7 +560,26 @@ void frame() {
         ImGui::SetTooltip("-1 = auto-detect CPU cores");
     }
     
-    ImGui::InputScalar("Seed", ImGuiDataType_S64, &appState.seed);
+    // Seed configuration
+    ImGui::Checkbox("Random Seed", &appState.useRandomSeed);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Generate a new random seed for each generation");
+    }
+    
+    if (!appState.useRandomSeed) {
+        ImGui::InputScalar("Seed", ImGuiDataType_S64, &appState.seed);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Fixed seed for reproducible results");
+        }
+    } else {
+        ImGui::BeginDisabled();
+        int64_t randomSeedDisplay = -1;
+        ImGui::InputScalar("Seed", ImGuiDataType_S64, &randomSeedDisplay);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Seed will be randomly generated");
+        }
+    }
     
     ImGui::Separator();
     ImGui::Checkbox("Enable Step Preview", &appState.enableStepPreview);
@@ -632,6 +666,14 @@ void frame() {
     
     if (!appState.lastGenerationTime.empty()) {
         ImGui::Text("Last generation time: %s", appState.lastGenerationTime.c_str());
+        ImGui::Text("Used seed: %lld", (long long)appState.lastUsedSeed);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy##seed")) {
+            ImGui::SetClipboardText(std::to_string(appState.lastUsedSeed).c_str());
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Copy seed to clipboard");
+        }
     }
     
     ImGuiIO& io = ImGui::GetIO();
