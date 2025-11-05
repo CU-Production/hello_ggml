@@ -36,6 +36,9 @@ struct AppState {
     float guidanceScale = 7.5f;
     int nThreads = -1;  // -1 = auto-detect
     int64_t seed = 42;
+    bool enableStepPreview = false;  // Enable step-by-step preview (slower)
+    int previewInterval = 5;  // Preview every N steps
+    bool realTimePreview = false;  // True real-time preview (VERY slow!)
     
     // Model paths
     char modelPath[512] = "E:/SW/ML/stable-diffusion-v1-5-gguf/stable-diffusion-v1-5-Q8_0.gguf";
@@ -167,6 +170,9 @@ void generateImage() {
         float cfg_scale;
         int n_threads;
         int64_t seed;
+        bool enableStepPreview;
+        int previewInterval;
+        bool realTimePreview;
         
         // Copy parameters from UI state
         {
@@ -178,6 +184,9 @@ void generateImage() {
             cfg_scale = appState.guidanceScale;
             n_threads = appState.nThreads;
             seed = appState.seed;
+            enableStepPreview = appState.enableStepPreview;
+            previewInterval = appState.previewInterval;
+            realTimePreview = appState.realTimePreview;
         }
         
         // Load model if not loaded or if model path changed
@@ -200,6 +209,7 @@ void generateImage() {
             ctx_params.wtype = SD_TYPE_COUNT;  // Use default from model
             ctx_params.rng_type = CUDA_RNG;
             ctx_params.vae_decode_only = true;
+            ctx_params.free_params_immediately = false;  // Keep params in memory for multiple generations
             
             // Create context
             appState.sd_ctx = new_sd_ctx(&ctx_params);
@@ -226,55 +236,125 @@ void generateImage() {
         // Set progress callback
         sd_set_progress_callback(progress_callback, nullptr);
         
-        // Initialize image generation parameters
-        sd_img_gen_params_t gen_params;
-        sd_img_gen_params_init(&gen_params);
-        
-        gen_params.prompt = prompt.c_str();
-        gen_params.negative_prompt = negativePrompt.c_str();
-        gen_params.clip_skip = -1;  // Auto
-        gen_params.width = 512;
-        gen_params.height = 512;
-        gen_params.seed = seed;
-        gen_params.batch_count = 1;
-        
-        // Configure sampling parameters
-        gen_params.sample_params.sample_steps = sample_steps;
-        gen_params.sample_params.guidance.txt_cfg = cfg_scale;
-        gen_params.sample_params.sample_method = sd_get_default_sample_method(appState.sd_ctx);
-        gen_params.sample_params.scheduler = DEFAULT;
-        
-        // Generate image
-        sd_image_t* results = generate_image(appState.sd_ctx, &gen_params);
-        
-        auto timeEnd = std::chrono::high_resolution_clock::now();
-        uint64_t milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(timeEnd - timeStart).count();
-        
-        if (results != nullptr && results[0].data != nullptr) {
-            // Convert RGB to RGBA
-            std::vector<uint8_t> rgbaData;
-            int width = results[0].width;
-            int height = results[0].height;
-            int channels = results[0].channel;
+        // Step-by-step preview generation
+        if (enableStepPreview && previewInterval > 0) {
+            appState.statusMessage = "Generating step-by-step preview...";
             
-            if (channels == 3) {
-                // Convert RGB to RGBA
-                rgbaData.resize(width * height * 4);
-                for (int i = 0; i < width * height; i++) {
-                    rgbaData[i * 4 + 0] = results[0].data[i * 3 + 0]; // R
-                    rgbaData[i * 4 + 1] = results[0].data[i * 3 + 1]; // G
-                    rgbaData[i * 4 + 2] = results[0].data[i * 3 + 2]; // B
-                    rgbaData[i * 4 + 3] = 255;                        // A
+            // Calculate preview steps
+            std::vector<int> previewSteps;
+            if (realTimePreview) {
+                // Generate every single step from 1 to sample_steps
+                for (int step = 1; step <= sample_steps; step++) {
+                    previewSteps.push_back(step);
                 }
-            } else if (channels == 4) {
-                // Already RGBA
-                rgbaData.assign(results[0].data, results[0].data + width * height * 4);
+            } else {
+                // Generate at interval
+                for (int step = previewInterval; step <= sample_steps; step += previewInterval) {
+                    previewSteps.push_back(step);
+                }
+                if (previewSteps.empty() || previewSteps.back() != sample_steps) {
+                    previewSteps.push_back(sample_steps);
+                }
             }
+            
+            // Generate images at each preview step
+            for (size_t i = 0; i < previewSteps.size(); i++) {
+                int current_steps = previewSteps[i];
+                
+                // Skip very low step counts as they may be unstable
+                if (current_steps < 1) {
+                    continue;
+                }
+                
+                {
+                    std::lock_guard<std::mutex> lock(appState.dataMutex);
+                    char statusStr[512];
+                    snprintf(statusStr, sizeof(statusStr), "Generating preview %zu/%zu (Steps: %d)", 
+                        i + 1, previewSteps.size(), current_steps);
+                    appState.statusMessage = statusStr;
+                }
+                
+                try {
+                    // Initialize image generation parameters
+                    sd_img_gen_params_t gen_params;
+                    sd_img_gen_params_init(&gen_params);
+                    
+                    gen_params.prompt = prompt.c_str();
+                    gen_params.negative_prompt = negativePrompt.c_str();
+                    gen_params.clip_skip = -1;
+                    gen_params.width = 512;
+                    gen_params.height = 512;
+                    // Use same seed to show progression of same image
+                    // Note: Each generation is independent, so RNG is reset each time
+                    gen_params.seed = seed;
+                    gen_params.batch_count = 1;
+                    
+                    gen_params.sample_params.sample_steps = current_steps;
+                    gen_params.sample_params.guidance.txt_cfg = cfg_scale;
+                    gen_params.sample_params.sample_method = sd_get_default_sample_method(appState.sd_ctx);
+                    gen_params.sample_params.scheduler = DEFAULT;
+                    
+                    // Generate image
+                    sd_image_t* results = generate_image(appState.sd_ctx, &gen_params);
+                    
+                    if (results == nullptr) {
+                        std::lock_guard<std::mutex> lock(appState.dataMutex);
+                        char errorStr[512];
+                        snprintf(errorStr, sizeof(errorStr), "Failed to generate preview at step %d", current_steps);
+                        appState.statusMessage = errorStr;
+                        continue;
+                    }
+                    
+                    if (results[0].data != nullptr) {
+                        // Convert to RGBA
+                        std::vector<uint8_t> rgbaData;
+                        int width = results[0].width;
+                        int height = results[0].height;
+                        int channels = results[0].channel;
+                        
+                        if (channels == 3) {
+                            rgbaData.resize(width * height * 4);
+                            for (int j = 0; j < width * height; j++) {
+                                rgbaData[j * 4 + 0] = results[0].data[j * 3 + 0];
+                                rgbaData[j * 4 + 1] = results[0].data[j * 3 + 1];
+                                rgbaData[j * 4 + 2] = results[0].data[j * 3 + 2];
+                                rgbaData[j * 4 + 3] = 255;
+                            }
+                        } else if (channels == 4) {
+                            rgbaData.assign(results[0].data, results[0].data + width * height * 4);
+                        }
+                        
+                        // Save to iteration history
+                        {
+                            std::lock_guard<std::mutex> lock(appState.dataMutex);
+                            appState.iterationImages.push_back(rgbaData);
+                            appState.totalIterations = (int)appState.iterationImages.size();
+                            appState.currentIterationIndex = appState.totalIterations - 1;
+                            
+                            // Update current image
+                            appState.imageData = rgbaData;
+                            appState.hasNewImage = true;
+                        }
+                        
+                        free(results[0].data);
+                    }
+                    
+                    free(results);
+                    
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lock(appState.dataMutex);
+                    char errorStr[512];
+                    snprintf(errorStr, sizeof(errorStr), "Error at step %d: %s", current_steps, e.what());
+                    appState.statusMessage = errorStr;
+                    continue;
+                }
+            }
+            
+            auto timeEnd = std::chrono::high_resolution_clock::now();
+            uint64_t milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(timeEnd - timeStart).count();
             
             {
                 std::lock_guard<std::mutex> lock(appState.dataMutex);
-                appState.imageData = std::move(rgbaData);
-                appState.hasNewImage = true;
                 appState.lastPrompt = prompt;
                 appState.lastNegativePrompt = negativePrompt;
                 
@@ -283,19 +363,77 @@ void generateImage() {
                 appState.lastGenerationTime = timeStr;
                 
                 char statusStr[512];
-                snprintf(statusStr, sizeof(statusStr), "Image generated in %.2fs (click Save to export)", 
-                    milliseconds / 1000.0f);
+                snprintf(statusStr, sizeof(statusStr), "Generated %d previews in %.2fs (use slider to review)", 
+                    appState.totalIterations, milliseconds / 1000.0f);
                 appState.statusMessage = statusStr;
             }
             
-            // Free image data
-            free(results[0].data);
         } else {
-            appState.statusMessage = "Error: Failed to generate image";
-        }
-        
-        if (results != nullptr) {
-            free(results);
+            // Normal single-shot generation
+            sd_img_gen_params_t gen_params;
+            sd_img_gen_params_init(&gen_params);
+            
+            gen_params.prompt = prompt.c_str();
+            gen_params.negative_prompt = negativePrompt.c_str();
+            gen_params.clip_skip = -1;
+            gen_params.width = 512;
+            gen_params.height = 512;
+            gen_params.seed = seed;
+            gen_params.batch_count = 1;
+            
+            gen_params.sample_params.sample_steps = sample_steps;
+            gen_params.sample_params.guidance.txt_cfg = cfg_scale;
+            gen_params.sample_params.sample_method = sd_get_default_sample_method(appState.sd_ctx);
+            gen_params.sample_params.scheduler = DEFAULT;
+            
+            sd_image_t* results = generate_image(appState.sd_ctx, &gen_params);
+            
+            auto timeEnd = std::chrono::high_resolution_clock::now();
+            uint64_t milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(timeEnd - timeStart).count();
+            
+            if (results != nullptr && results[0].data != nullptr) {
+                std::vector<uint8_t> rgbaData;
+                int width = results[0].width;
+                int height = results[0].height;
+                int channels = results[0].channel;
+                
+                if (channels == 3) {
+                    rgbaData.resize(width * height * 4);
+                    for (int i = 0; i < width * height; i++) {
+                        rgbaData[i * 4 + 0] = results[0].data[i * 3 + 0];
+                        rgbaData[i * 4 + 1] = results[0].data[i * 3 + 1];
+                        rgbaData[i * 4 + 2] = results[0].data[i * 3 + 2];
+                        rgbaData[i * 4 + 3] = 255;
+                    }
+                } else if (channels == 4) {
+                    rgbaData.assign(results[0].data, results[0].data + width * height * 4);
+                }
+                
+                {
+                    std::lock_guard<std::mutex> lock(appState.dataMutex);
+                    appState.imageData = std::move(rgbaData);
+                    appState.hasNewImage = true;
+                    appState.lastPrompt = prompt;
+                    appState.lastNegativePrompt = negativePrompt;
+                    
+                    char timeStr[64];
+                    snprintf(timeStr, sizeof(timeStr), "%.2fs", milliseconds / 1000.0f);
+                    appState.lastGenerationTime = timeStr;
+                    
+                    char statusStr[512];
+                    snprintf(statusStr, sizeof(statusStr), "Image generated in %.2fs (click Save to export)", 
+                        milliseconds / 1000.0f);
+                    appState.statusMessage = statusStr;
+                }
+                
+                free(results[0].data);
+            } else {
+                appState.statusMessage = "Error: Failed to generate image";
+            }
+            
+            if (results != nullptr) {
+                free(results);
+            }
         }
         
     } catch (const std::exception& e) {
@@ -408,6 +546,34 @@ void frame() {
     }
     
     ImGui::InputScalar("Seed", ImGuiDataType_S64, &appState.seed);
+    
+    ImGui::Separator();
+    ImGui::Checkbox("Enable Step Preview", &appState.enableStepPreview);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Generate images at multiple step counts to see progression\n(Much slower! ~N times slower where N is steps/interval)");
+    }
+    
+    if (appState.enableStepPreview) {
+        ImGui::Checkbox("Real-Time Mode (Every Step)", &appState.realTimePreview);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Generate image after EVERY denoising step\nVERY SLOW but shows true progression!");
+        }
+        
+        if (!appState.realTimePreview) {
+            ImGui::SliderInt("Preview Interval", &appState.previewInterval, 1, 10);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Generate preview every N steps (lower = more previews but slower)");
+            }
+            
+            int estimatedPreviews = (appState.numInferenceSteps + appState.previewInterval - 1) / appState.previewInterval;
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Will generate ~%d previews", estimatedPreviews);
+            ImGui::TextWrapped("Estimated time: %.1fx normal", (float)estimatedPreviews);
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.0f, 1.0f), "Will generate %d previews (EVERY step!)", appState.numInferenceSteps);
+            ImGui::TextWrapped("Estimated time: ~%dx normal (VERY SLOW!)", appState.numInferenceSteps);
+            ImGui::TextWrapped("This will decode VAE %d times!", appState.numInferenceSteps);
+        }
+    }
     
     ImGui::SeparatorText("Model Path");
     if (ImGui::TreeNode("Model Configuration")) {
