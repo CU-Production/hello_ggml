@@ -41,9 +41,6 @@ int main()
         cfg_scale = 1.0f;        // FLUX typically uses CFG scale 1.0-3.5
         width = 512;             // Reduced from 1024 to avoid timeout (can increase later)
         height = 512;            // Start with lower resolution first
-        
-        std::cout << "Note: Using reduced parameters to avoid Vulkan timeout." << std::endl;
-        std::cout << "      Once stable, you can increase to 1024x1024 and 20-50 steps." << std::endl;
     } else {
         // SD 1.5 parameters
         sample_steps = 15;
@@ -95,8 +92,8 @@ int main()
         ctx_params.rng_type = STD_DEFAULT_RNG;   // Important: Use CPU RNG for Vulkan
 
         // Disable optimizations that may cause VAE decode hang
-        ctx_params.diffusion_flash_attn = false;
-        ctx_params.vae_conv_direct = false;      // Disable direct VAE conv to avoid hang
+        // ctx_params.diffusion_flash_attn = false;
+        // ctx_params.vae_conv_direct = false;      // Disable direct VAE conv to avoid hang
         
         std::cout << "  Diffusion model: " << flux_diffusion_model << std::endl;
         std::cout << "  VAE: " << flux_vae << std::endl;
