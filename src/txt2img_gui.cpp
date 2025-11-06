@@ -37,7 +37,7 @@ struct AppState {
     float guidanceScale = 7.5f;
     int nThreads = -1;  // -1 = auto-detect
     int64_t seed = 42;
-    bool useRandomSeed = false;  // Use random seed for each generation
+    bool useRandomSeed = true;  // Use random seed for each generation
     bool enableStepPreview = false;  // Enable step-by-step preview (slower)
     int previewInterval = 5;  // Preview every N steps
     bool realTimePreview = false;  // True real-time preview (VERY slow!)
