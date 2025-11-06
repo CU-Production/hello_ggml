@@ -42,8 +42,17 @@ struct AppState {
     int previewInterval = 5;  // Preview every N steps
     bool realTimePreview = false;  // True real-time preview (VERY slow!)
     
-    // Model paths
+    // Model selection
+    int modelType = 0;  // 0 = SD 1.5, 1 = FLUX
+    
+    // SD 1.5 Model path
     char modelPath[512] = "E:/SW/ML/stable-diffusion-v1-5-gguf/stable-diffusion-v1-5-Q8_0.gguf";
+    
+    // FLUX Model paths
+    char fluxDiffusionModel[512] = "E:/SW/ML/FLUX.1-dev-gguf/flux1-dev-Q8_0.gguf";
+    char fluxVae[512] = "E:/SW/ML/FLUX.1-dev/ae.sft";
+    char fluxClipL[512] = "E:/SW/ML/flux_text_encoders/clip_l.safetensors";
+    char fluxT5xxl[512] = "E:/SW/ML/flux_text_encoders/t5xxl_fp16.safetensors";
     
     // Generation state
     std::atomic<bool> isGenerating{false};
@@ -74,6 +83,7 @@ struct AppState {
     // Stable Diffusion context (created once)
     sd_ctx_t* sd_ctx = nullptr;
     bool contextLoaded = false;
+    std::string lastModelType = "";  // Track model type changes
 } appState;
 
 // Function to save the current image
@@ -178,12 +188,20 @@ void generateImage() {
         int previewInterval;
         bool realTimePreview;
         
+        bool useFlux;
+        std::string fluxDiffusionModel, fluxVae, fluxClipL, fluxT5xxl;
+        
         // Copy parameters from UI state
         {
             std::lock_guard<std::mutex> lock(appState.dataMutex);
             prompt = std::string(appState.prompt);
             negativePrompt = std::string(appState.negativePrompt);
             modelPath = std::string(appState.modelPath);
+            useFlux = (appState.modelType == 1);
+            fluxDiffusionModel = std::string(appState.fluxDiffusionModel);
+            fluxVae = std::string(appState.fluxVae);
+            fluxClipL = std::string(appState.fluxClipL);
+            fluxT5xxl = std::string(appState.fluxT5xxl);
             sample_steps = appState.numInferenceSteps;
             cfg_scale = appState.guidanceScale;
             n_threads = appState.nThreads;
@@ -202,9 +220,13 @@ void generateImage() {
             seed = dis(gen);
         }
         
-        // Load model if not loaded or if model path changed
-        if (!appState.contextLoaded || appState.lastPrompt.empty()) {
-            appState.statusMessage = "Loading model...";
+        // Check if model needs to be reloaded (first load or model type changed)
+        std::string currentModelType = useFlux ? "FLUX" : "SD15";
+        bool needsReload = !appState.contextLoaded || appState.lastModelType != currentModelType;
+        
+        // Load model if needed
+        if (needsReload) {
+            appState.statusMessage = useFlux ? "Loading FLUX model..." : "Loading SD 1.5 model...";
             
             // Free existing context if any
             if (appState.sd_ctx != nullptr) {
@@ -217,12 +239,32 @@ void generateImage() {
             sd_ctx_params_t ctx_params;
             sd_ctx_params_init(&ctx_params);
             
-            ctx_params.model_path = modelPath.c_str();
             ctx_params.n_threads = n_threads;
             ctx_params.wtype = SD_TYPE_COUNT;  // Use default from model
-            ctx_params.rng_type = CUDA_RNG;
-            ctx_params.vae_decode_only = true;
-            ctx_params.free_params_immediately = false;  // Keep params in memory for multiple generations
+            
+            if (useFlux) {
+                // FLUX configuration (based on successful CLI setup)
+                ctx_params.diffusion_model_path = fluxDiffusionModel.c_str();
+                ctx_params.vae_path = fluxVae.c_str();
+                ctx_params.clip_l_path = fluxClipL.c_str();
+                ctx_params.t5xxl_path = fluxT5xxl.c_str();
+                ctx_params.vae_decode_only = false;
+                
+                // Memory optimization (based on working CLI config)
+                ctx_params.keep_clip_on_cpu = false;
+                ctx_params.keep_vae_on_cpu = false;
+                ctx_params.offload_params_to_cpu = true;
+                
+                // Use CPU RNG for Vulkan compatibility
+                ctx_params.rng_type = STD_DEFAULT_RNG;
+                ctx_params.free_params_immediately = false;
+            } else {
+                // SD 1.5 configuration
+                ctx_params.model_path = modelPath.c_str();
+                ctx_params.vae_decode_only = true;
+                ctx_params.rng_type = CUDA_RNG;
+                ctx_params.free_params_immediately = false;
+            }
             
             // Create context
             appState.sd_ctx = new_sd_ctx(&ctx_params);
@@ -234,6 +276,7 @@ void generateImage() {
             }
             
             appState.contextLoaded = true;
+            appState.lastModelType = currentModelType;
         }
         
         appState.statusMessage = "Generating image...";
@@ -304,8 +347,14 @@ void generateImage() {
                     
                     gen_params.sample_params.sample_steps = current_steps;
                     gen_params.sample_params.guidance.txt_cfg = cfg_scale;
-                    gen_params.sample_params.sample_method = sd_get_default_sample_method(appState.sd_ctx);
-                    gen_params.sample_params.scheduler = DEFAULT;
+                    
+                    if (useFlux) {
+                        gen_params.sample_params.sample_method = EULER;
+                        gen_params.sample_params.scheduler = SIMPLE;
+                    } else {
+                        gen_params.sample_params.sample_method = sd_get_default_sample_method(appState.sd_ctx);
+                        gen_params.sample_params.scheduler = DEFAULT;
+                    }
                     
                     // Generate image
                     sd_image_t* results = generate_image(appState.sd_ctx, &gen_params);
@@ -397,8 +446,14 @@ void generateImage() {
             
             gen_params.sample_params.sample_steps = sample_steps;
             gen_params.sample_params.guidance.txt_cfg = cfg_scale;
-            gen_params.sample_params.sample_method = sd_get_default_sample_method(appState.sd_ctx);
-            gen_params.sample_params.scheduler = DEFAULT;
+            
+            if (useFlux) {
+                gen_params.sample_params.sample_method = EULER;
+                gen_params.sample_params.scheduler = SIMPLE;
+            } else {
+                gen_params.sample_params.sample_method = sd_get_default_sample_method(appState.sd_ctx);
+                gen_params.sample_params.scheduler = DEFAULT;
+            }
             
             sd_image_t* results = generate_image(appState.sd_ctx, &gen_params);
             
@@ -552,6 +607,14 @@ void frame() {
         ImVec2(-1, 40), ImGuiInputTextFlags_WordWrap);
     
     ImGui::SeparatorText("Generation Parameters");
+    
+    // Show recommended parameters based on model type
+    if (appState.modelType == 1) {
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "FLUX Recommended: 20 steps, CFG 1.0");
+    } else {
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "SD 1.5 Recommended: 15 steps, CFG 7.5");
+    }
+    
     ImGui::SliderInt("Inference Steps", &appState.numInferenceSteps, 1, 100);
     ImGui::SliderFloat("Guidance Scale", &appState.guidanceScale, 1.0f, 20.0f, "%.1f");
     
@@ -609,23 +672,140 @@ void frame() {
         }
     }
     
-    ImGui::SeparatorText("Model Path");
-    if (ImGui::TreeNode("Model Configuration")) {
-        ImGui::InputText("Model (GGUF)", appState.modelPath, sizeof(appState.modelPath));
-        ImGui::TextWrapped("Note: You need a GGUF format Stable Diffusion model. "
-                          "You can convert from safetensors using stable-diffusion.cpp tools.");
-        ImGui::TreePop();
+    ImGui::SeparatorText("Model Configuration");
+    
+    // Model type selection
+    ImGui::Text("Model Type:");
+    ImGui::RadioButton("Stable Diffusion 1.5", &appState.modelType, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("FLUX.1-dev", &appState.modelType, 1);
+    
+    ImGui::Separator();
+    
+    if (appState.modelType == 0) {
+        // SD 1.5 Configuration
+        if (ImGui::TreeNode("SD 1.5 Model Path")) {
+            ImGui::InputText("Model (GGUF)", appState.modelPath, sizeof(appState.modelPath));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Browse##sd15")) {
+                nfdchar_t* outPath = nullptr;
+                nfdfilteritem_t filters[1] = {{"GGUF Models", "gguf"}};
+                nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+                if (result == NFD_OKAY) {
+                    strncpy(appState.modelPath, outPath, sizeof(appState.modelPath) - 1);
+                    NFD_FreePath(outPath);
+                }
+            }
+            ImGui::TextWrapped("Single GGUF file for Stable Diffusion 1.5");
+            ImGui::TreePop();
+        }
+    } else {
+        // FLUX Configuration
+        if (ImGui::TreeNode("FLUX Model Paths (4 files required)")) {
+            ImGui::Text("Diffusion Model (GGUF):");
+            ImGui::InputText("##flux_diff", appState.fluxDiffusionModel, sizeof(appState.fluxDiffusionModel));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Browse##flux_diff")) {
+                nfdchar_t* outPath = nullptr;
+                nfdfilteritem_t filters[1] = {{"GGUF Models", "gguf"}};
+                nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+                if (result == NFD_OKAY) {
+                    strncpy(appState.fluxDiffusionModel, outPath, sizeof(appState.fluxDiffusionModel) - 1);
+                    NFD_FreePath(outPath);
+                }
+            }
+            
+            ImGui::Text("VAE (.sft):");
+            ImGui::InputText("##flux_vae", appState.fluxVae, sizeof(appState.fluxVae));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Browse##flux_vae")) {
+                nfdchar_t* outPath = nullptr;
+                nfdfilteritem_t filters[1] = {{"VAE Files", "sft"}};
+                nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+                if (result == NFD_OKAY) {
+                    strncpy(appState.fluxVae, outPath, sizeof(appState.fluxVae) - 1);
+                    NFD_FreePath(outPath);
+                }
+            }
+            
+            ImGui::Text("CLIP-L (.safetensors):");
+            ImGui::InputText("##flux_clip_l", appState.fluxClipL, sizeof(appState.fluxClipL));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Browse##flux_clip_l")) {
+                nfdchar_t* outPath = nullptr;
+                nfdfilteritem_t filters[1] = {{"SafeTensors", "safetensors"}};
+                nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+                if (result == NFD_OKAY) {
+                    strncpy(appState.fluxClipL, outPath, sizeof(appState.fluxClipL) - 1);
+                    NFD_FreePath(outPath);
+                }
+            }
+            
+            ImGui::Text("T5-XXL (.safetensors):");
+            ImGui::InputText("##flux_t5xxl", appState.fluxT5xxl, sizeof(appState.fluxT5xxl));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Browse##flux_t5xxl")) {
+                nfdchar_t* outPath = nullptr;
+                nfdfilteritem_t filters[1] = {{"SafeTensors", "safetensors"}};
+                nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+                if (result == NFD_OKAY) {
+                    strncpy(appState.fluxT5xxl, outPath, sizeof(appState.fluxT5xxl) - 1);
+                    NFD_FreePath(outPath);
+                }
+            }
+            
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "FLUX: ~35GB disk, 12GB+ VRAM, slower generation");
+            ImGui::TreePop();
+        }
     }
     
     ImGui::Separator();
     
     // Generate button
     bool generating = appState.isGenerating.load();
+    // Quick parameter presets
+    if (ImGui::Button("Quick Preset")) {
+        ImGui::OpenPopup("preset_popup");
+    }
+    if (ImGui::BeginPopup("preset_popup")) {
+        if (appState.modelType == 1) {
+            ImGui::Text("FLUX Presets:");
+            if (ImGui::Selectable("Fast (512x512, 15 steps)")) {
+                appState.numInferenceSteps = 15;
+                appState.guidanceScale = 1.0f;
+            }
+            if (ImGui::Selectable("Standard (512x512, 20 steps)")) {
+                appState.numInferenceSteps = 20;
+                appState.guidanceScale = 1.0f;
+            }
+            if (ImGui::Selectable("Quality (1024x1024, 25 steps)")) {
+                appState.numInferenceSteps = 25;
+                appState.guidanceScale = 1.5f;
+            }
+        } else {
+            ImGui::Text("SD 1.5 Presets:");
+            if (ImGui::Selectable("Fast (15 steps, CFG 7.5)")) {
+                appState.numInferenceSteps = 15;
+                appState.guidanceScale = 7.5f;
+            }
+            if (ImGui::Selectable("Standard (25 steps, CFG 7.5)")) {
+                appState.numInferenceSteps = 25;
+                appState.guidanceScale = 7.5f;
+            }
+            if (ImGui::Selectable("Quality (50 steps, CFG 9.0)")) {
+                appState.numInferenceSteps = 50;
+                appState.guidanceScale = 9.0f;
+            }
+        }
+        ImGui::EndPopup();
+    }
+    
     if (generating) {
         ImGui::BeginDisabled();
     }
     
-    if (ImGui::Button("Generate Image", ImVec2(-1, 40))) {
+    std::string buttonText = (appState.modelType == 1) ? "Generate Image (FLUX)" : "Generate Image (SD 1.5)";
+    if (ImGui::Button(buttonText.c_str(), ImVec2(-1, 40))) {
         // Start generation in background thread
         if (appState.generationThread != nullptr) {
             if (appState.generationThread->joinable()) {
