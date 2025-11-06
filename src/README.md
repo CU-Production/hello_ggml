@@ -5,8 +5,14 @@
 1. download sd1.5 or flux.1 guuf models
 
 ```bash
+# for main model (flux1-*.gguf)
 git clone https://huggingface.co/leejet/FLUX.1-dev-gguf
-# or
+# for VAE model (as.safetensor)
+git clone https://huggingface.co/camenduru/FLUX.1-dev
+# for clip_l & t5xxl model (clip_l.safetensors & t5xxl-*.safetensor)
+git clone https://huggingface.co/comfyanonymous/flux_text_encoders
+
+# for main model sd1.5.gguf
 git clone https://huggingface.co/gpustack/stable-diffusion-v1-5-GGUF
 
 git lfs pull

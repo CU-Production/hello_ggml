@@ -15,19 +15,45 @@ int main()
     std::string prompt = "a photo of an astronaut riding a horse on mars";
     std::string negative_prompt = "";
     
-    // Model path - update this to your stable-diffusion GGUF model path
-    const char* model_path = "E:/SW/ML/stable-diffusion-v1-5-gguf/stable-diffusion-v1-5-Q8_0.gguf";
-    // const char* model_path = "E:/SW/ML/FLUX.1-dev-gguf/flux1-dev-Q8_0.gguf";
-    // const char* model_path = "E:/SW/ML/FLUX.1-dev-gguf/flux1-dev-Q4_K_S.gguf";
+    // Choose which model to use
+    bool use_flux = true;  // Set to false to use SD 1.5
+    
+    // SD 1.5 model path
+    const char* sd15_model_path = "E:/SW/ML/stable-diffusion-v1-5-gguf/stable-diffusion-v1-5-Q8_0.gguf";
+    
+    // FLUX model paths
+    const char* flux_diffusion_model = "E:/SW/ML/FLUX.1-dev-gguf/flux1-dev-Q8_0.gguf";
+    const char* flux_vae = "E:/SW/ML/FLUX.1-dev/ae.sft";
+    const char* flux_clip_l = "E:/SW/ML/flux_text_encoders/clip_l.safetensors";
+    const char* flux_t5xxl = "E:/SW/ML/flux_text_encoders/t5xxl_fp16.safetensors";
 
     int n_threads = -1;  // -1 means auto-detect
-    int sample_steps = 15;
-    float cfg_scale = 7.5f;
-    int width = 512;
-    int height = 512;
+    
+    // Parameters (auto-configured based on model type)
+    int sample_steps;
+    float cfg_scale;
+    int width;
+    int height;
+    
+    if (use_flux) {
+        // FLUX parameters - reduced to avoid Vulkan timeout
+        sample_steps = 20;       // Reduced from 20 to avoid timeout
+        cfg_scale = 1.0f;        // FLUX typically uses CFG scale 1.0-3.5
+        width = 512;             // Reduced from 1024 to avoid timeout (can increase later)
+        height = 512;            // Start with lower resolution first
+        
+        std::cout << "Note: Using reduced parameters to avoid Vulkan timeout." << std::endl;
+        std::cout << "      Once stable, you can increase to 1024x1024 and 20-50 steps." << std::endl;
+    } else {
+        // SD 1.5 parameters
+        sample_steps = 15;
+        cfg_scale = 7.5f;
+        width = 512;
+        height = 512;
+    }
     
     // Seed configuration
-    bool use_random_seed = true;  // Set to true for random seed each run
+    bool use_random_seed = true;    // Set to true for random seed each run
     int64_t seed = 42;              // Fixed seed (used when use_random_seed = false)
     
     // Generate random seed if requested
@@ -39,19 +65,50 @@ int main()
     }
     
     std::cout << "Prompt: " << prompt << std::endl;
-    std::cout << "Model: " << model_path << std::endl;
+    std::cout << "Model: " << (use_flux ? "FLUX.1-dev" : "Stable Diffusion 1.5") << std::endl;
     std::cout << "Seed: " << seed << (use_random_seed ? " (random)" : " (fixed)") << std::endl;
     std::cout << "Steps: " << sample_steps << ", CFG Scale: " << cfg_scale << std::endl;
+    std::cout << "Resolution: " << width << "x" << height << std::endl;
     
     // Initialize context parameters
     sd_ctx_params_t ctx_params;
     sd_ctx_params_init(&ctx_params);
     
-    ctx_params.model_path = model_path;
     ctx_params.n_threads = n_threads;
     ctx_params.wtype = SD_TYPE_COUNT;  // Use default weight type from model
-    ctx_params.rng_type = CUDA_RNG;
-    ctx_params.vae_decode_only = true;
+    
+    if (use_flux) {
+        // FLUX configuration
+        std::cout << "Configuring FLUX model..." << std::endl;
+        ctx_params.diffusion_model_path = flux_diffusion_model;
+        ctx_params.vae_path = flux_vae;
+        ctx_params.clip_l_path = flux_clip_l;
+        ctx_params.t5xxl_path = flux_t5xxl;
+        ctx_params.vae_decode_only = false;      // FLUX needs full model
+        
+        // Memory optimization to avoid Vulkan timeout
+        ctx_params.keep_clip_on_cpu = false;     // Keep CLIP on CPU (text encoding only, fast)
+        ctx_params.keep_vae_on_cpu = false;      // VAE must stay on GPU to avoid transfer issues
+        ctx_params.offload_params_to_cpu = true; // Disabled: can cause transfer deadlock
+        
+        // Use CPU RNG to avoid CUDA_RNG conflict with Vulkan backend
+        ctx_params.rng_type = STD_DEFAULT_RNG;   // Important: Use CPU RNG for Vulkan
+
+        // Disable optimizations that may cause VAE decode hang
+        ctx_params.diffusion_flash_attn = false;
+        ctx_params.vae_conv_direct = false;      // Disable direct VAE conv to avoid hang
+        
+        std::cout << "  Diffusion model: " << flux_diffusion_model << std::endl;
+        std::cout << "  VAE: " << flux_vae << std::endl;
+        std::cout << "  CLIP-L: " << flux_clip_l << std::endl;
+        std::cout << "  T5-XXL: " << flux_t5xxl << std::endl;
+    } else {
+        // SD 1.5 configuration
+        ctx_params.model_path = sd15_model_path;
+        ctx_params.vae_decode_only = true;
+        ctx_params.rng_type = CUDA_RNG;  // SD 1.5 can use CUDA_RNG
+        // ctx_params.rng_type = STD_DEFAULT_RNG;
+    }
     
     // Create stable diffusion context
     std::cout << "Loading model..." << std::endl;
@@ -79,8 +136,16 @@ int main()
     // Configure sampling parameters
     gen_params.sample_params.sample_steps = sample_steps;
     gen_params.sample_params.guidance.txt_cfg = cfg_scale;
-    gen_params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx);
-    gen_params.sample_params.scheduler = DEFAULT;
+    
+    if (use_flux) {
+        // FLUX sampling configuration
+        gen_params.sample_params.sample_method = EULER;
+        gen_params.sample_params.scheduler = SIMPLE;
+    } else {
+        // SD 1.5 sampling configuration
+        gen_params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx);
+        gen_params.sample_params.scheduler = DEFAULT;
+    }
     
     // Generate image
     std::cout << "Generating image..." << std::endl;
