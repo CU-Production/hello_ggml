@@ -22,8 +22,9 @@ int main()
     const char* sd15_model_path = "E:/SW/ML/stable-diffusion-v1-5-gguf/stable-diffusion-v1-5-Q8_0.gguf";
     
     // FLUX model paths
-    const char* flux_diffusion_model = "E:/SW/ML/FLUX.1-dev-gguf/flux1-dev-Q8_0.gguf";
-    const char* flux_vae = "E:/SW/ML/FLUX.1-dev/ae.sft";
+    // Change this to your schnell model path:
+    const char* flux_diffusion_model = "E:/SW/ML/FLUX.1-schnell-gguf/flux1-schnell-Q8_0.gguf";
+    const char* flux_vae = "E:/SW/ML/FLUX.1-dev/ae.sft";  // VAE is the same for both dev and schnell
     const char* flux_clip_l = "E:/SW/ML/flux_text_encoders/clip_l.safetensors";
     const char* flux_t5xxl = "E:/SW/ML/flux_text_encoders/t5xxl_fp16.safetensors";
 
@@ -36,11 +37,11 @@ int main()
     int height;
     
     if (use_flux) {
-        // FLUX parameters - reduced to avoid Vulkan timeout
-        sample_steps = 20;       // Reduced from 20 to avoid timeout
-        cfg_scale = 1.0f;        // FLUX typically uses CFG scale 1.0-3.5
-        width = 512;             // Reduced from 1024 to avoid timeout (can increase later)
-        height = 512;            // Start with lower resolution first
+        // FLUX-schnell parameters - faster and no guidance restrictions
+        sample_steps = 4;        // Schnell works great with just 4-8 steps!
+        cfg_scale = 1.0f;        // Schnell ignores CFG (guidance is disabled)
+        width = 512;             // Can increase to 1024 if you want
+        height = 512;            // Can increase to 1024 if you want
     } else {
         // SD 1.5 parameters
         sample_steps = 15;
@@ -62,10 +63,17 @@ int main()
     }
     
     std::cout << "Prompt: " << prompt << std::endl;
-    std::cout << "Model: " << (use_flux ? "FLUX.1-dev" : "Stable Diffusion 1.5") << std::endl;
+    std::cout << "Model: " << (use_flux ? "FLUX.1-schnell" : "Stable Diffusion 1.5") << std::endl;
     std::cout << "Seed: " << seed << (use_random_seed ? " (random)" : " (fixed)") << std::endl;
     std::cout << "Steps: " << sample_steps << ", CFG Scale: " << cfg_scale << std::endl;
     std::cout << "Resolution: " << width << "x" << height << std::endl;
+    
+    if (use_flux) {
+        std::cout << "\nFLUX.1-schnell optimizations:" << std::endl;
+        std::cout << "  - Ultra-fast: 4 steps (vs 20 for dev)" << std::endl;
+        std::cout << "  - No guidance restrictions" << std::endl;
+        std::cout << "  - Distilled model, same quality" << std::endl;
+    }
     
     // Initialize context parameters
     sd_ctx_params_t ctx_params;

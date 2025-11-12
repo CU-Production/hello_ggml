@@ -44,12 +44,14 @@ struct AppState {
     
     // Model selection
     int modelType = 0;  // 0 = SD 1.5, 1 = FLUX
+    int fluxVariant = 0;  // 0 = dev, 1 = schnell
     
     // SD 1.5 Model path
     char modelPath[512] = "E:/SW/ML/stable-diffusion-v1-5-gguf/stable-diffusion-v1-5-Q8_0.gguf";
     
     // FLUX Model paths
-    char fluxDiffusionModel[512] = "E:/SW/ML/FLUX.1-dev-gguf/flux1-dev-Q8_0.gguf";
+    char fluxDevDiffusionModel[512] = "E:/SW/ML/FLUX.1-dev-gguf/flux1-dev-Q8_0.gguf";
+    char fluxSchnellDiffusionModel[512] = "E:/SW/ML/FLUX.1-schnell-gguf/flux1-schnell-Q8_0.gguf";
     char fluxVae[512] = "E:/SW/ML/FLUX.1-dev/ae.sft";
     char fluxClipL[512] = "E:/SW/ML/flux_text_encoders/clip_l.safetensors";
     char fluxT5xxl[512] = "E:/SW/ML/flux_text_encoders/t5xxl_fp16.safetensors";
@@ -189,6 +191,7 @@ void generateImage() {
         bool realTimePreview;
         
         bool useFlux;
+        bool useSchnell;
         std::string fluxDiffusionModel, fluxVae, fluxClipL, fluxT5xxl;
         
         // Copy parameters from UI state
@@ -198,7 +201,13 @@ void generateImage() {
             negativePrompt = std::string(appState.negativePrompt);
             modelPath = std::string(appState.modelPath);
             useFlux = (appState.modelType == 1);
-            fluxDiffusionModel = std::string(appState.fluxDiffusionModel);
+            useSchnell = (appState.fluxVariant == 1);
+            
+            // Select appropriate FLUX model based on variant
+            if (useFlux) {
+                fluxDiffusionModel = useSchnell ? std::string(appState.fluxSchnellDiffusionModel) : std::string(appState.fluxDevDiffusionModel);
+            }
+            
             fluxVae = std::string(appState.fluxVae);
             fluxClipL = std::string(appState.fluxClipL);
             fluxT5xxl = std::string(appState.fluxT5xxl);
@@ -221,12 +230,16 @@ void generateImage() {
         }
         
         // Check if model needs to be reloaded (first load or model type changed)
-        std::string currentModelType = useFlux ? "FLUX" : "SD15";
+        std::string currentModelType = useFlux ? (useSchnell ? "FLUX-schnell" : "FLUX-dev") : "SD15";
         bool needsReload = !appState.contextLoaded || appState.lastModelType != currentModelType;
         
         // Load model if needed
         if (needsReload) {
-            appState.statusMessage = useFlux ? "Loading FLUX model..." : "Loading SD 1.5 model...";
+            if (useFlux) {
+                appState.statusMessage = useSchnell ? "Loading FLUX-schnell model..." : "Loading FLUX-dev model...";
+            } else {
+                appState.statusMessage = "Loading SD 1.5 model...";
+            }
             
             // Free existing context if any
             if (appState.sd_ctx != nullptr) {
@@ -610,9 +623,30 @@ void frame() {
     
     // Show recommended parameters based on model type
     if (appState.modelType == 1) {
-        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "FLUX Recommended: 20 steps, CFG 1.0");
+        if (appState.fluxVariant == 0) {
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "FLUX-dev Recommended: 20 steps, CFG 1.0");
+        } else {
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "FLUX-schnell Recommended: 4 steps, CFG 1.0");
+        }
     } else {
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "SD 1.5 Recommended: 15 steps, CFG 7.5");
+    }
+    
+    // Quick apply recommended settings button
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Apply Recommended")) {
+        if (appState.modelType == 1) {
+            if (appState.fluxVariant == 0) {
+                appState.numInferenceSteps = 20;
+                appState.guidanceScale = 1.0f;
+            } else {
+                appState.numInferenceSteps = 4;
+                appState.guidanceScale = 1.0f;
+            }
+        } else {
+            appState.numInferenceSteps = 15;
+            appState.guidanceScale = 7.5f;
+        }
     }
     
     ImGui::SliderInt("Inference Steps", &appState.numInferenceSteps, 1, 100);
@@ -678,7 +712,20 @@ void frame() {
     ImGui::Text("Model Type:");
     ImGui::RadioButton("Stable Diffusion 1.5", &appState.modelType, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("FLUX.1-dev", &appState.modelType, 1);
+    ImGui::RadioButton("FLUX", &appState.modelType, 1);
+    
+    // FLUX variant selection (only shown when FLUX is selected)
+    if (appState.modelType == 1) {
+        ImGui::Indent();
+        ImGui::Text("FLUX Variant:");
+        ImGui::RadioButton("FLUX.1-dev (20 steps)", &appState.fluxVariant, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("FLUX.1-schnell (4 steps, faster)", &appState.fluxVariant, 1);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Schnell is faster and has no restrictions");
+        }
+        ImGui::Unindent();
+    }
     
     ImGui::Separator();
     
@@ -701,16 +748,28 @@ void frame() {
         }
     } else {
         // FLUX Configuration
-        if (ImGui::TreeNode("FLUX Model Paths (4 files required)")) {
+        const char* variantName = (appState.fluxVariant == 0) ? "dev" : "schnell";
+        char treeNodeLabel[128];
+        snprintf(treeNodeLabel, sizeof(treeNodeLabel), "FLUX-%s Model Paths (4 files required)", variantName);
+        
+        if (ImGui::TreeNode(treeNodeLabel)) {
             ImGui::Text("Diffusion Model (GGUF):");
-            ImGui::InputText("##flux_diff", appState.fluxDiffusionModel, sizeof(appState.fluxDiffusionModel));
+            if (appState.fluxVariant == 0) {
+                ImGui::InputText("##flux_dev_diff", appState.fluxDevDiffusionModel, sizeof(appState.fluxDevDiffusionModel));
+            } else {
+                ImGui::InputText("##flux_schnell_diff", appState.fluxSchnellDiffusionModel, sizeof(appState.fluxSchnellDiffusionModel));
+            }
             ImGui::SameLine();
             if (ImGui::SmallButton("Browse##flux_diff")) {
                 nfdchar_t* outPath = nullptr;
                 nfdfilteritem_t filters[1] = {{"GGUF Models", "gguf"}};
                 nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
                 if (result == NFD_OKAY) {
-                    strncpy(appState.fluxDiffusionModel, outPath, sizeof(appState.fluxDiffusionModel) - 1);
+                    if (appState.fluxVariant == 0) {
+                        strncpy(appState.fluxDevDiffusionModel, outPath, sizeof(appState.fluxDevDiffusionModel) - 1);
+                    } else {
+                        strncpy(appState.fluxSchnellDiffusionModel, outPath, sizeof(appState.fluxSchnellDiffusionModel) - 1);
+                    }
                     NFD_FreePath(outPath);
                 }
             }
@@ -769,18 +828,30 @@ void frame() {
     }
     if (ImGui::BeginPopup("preset_popup")) {
         if (appState.modelType == 1) {
-            ImGui::Text("FLUX Presets:");
-            if (ImGui::Selectable("Fast (512x512, 15 steps)")) {
-                appState.numInferenceSteps = 15;
-                appState.guidanceScale = 1.0f;
-            }
-            if (ImGui::Selectable("Standard (512x512, 20 steps)")) {
-                appState.numInferenceSteps = 20;
-                appState.guidanceScale = 1.0f;
-            }
-            if (ImGui::Selectable("Quality (1024x1024, 25 steps)")) {
-                appState.numInferenceSteps = 25;
-                appState.guidanceScale = 1.5f;
+            if (appState.fluxVariant == 0) {
+                ImGui::Text("FLUX-dev Presets:");
+                if (ImGui::Selectable("Fast (512x512, 15 steps)")) {
+                    appState.numInferenceSteps = 15;
+                    appState.guidanceScale = 1.0f;
+                }
+                if (ImGui::Selectable("Standard (512x512, 20 steps)")) {
+                    appState.numInferenceSteps = 20;
+                    appState.guidanceScale = 1.0f;
+                }
+            } else {
+                ImGui::Text("FLUX-schnell Presets:");
+                if (ImGui::Selectable("Ultra Fast (512x512, 2 steps)")) {
+                    appState.numInferenceSteps = 2;
+                    appState.guidanceScale = 1.0f;
+                }
+                if (ImGui::Selectable("Standard (512x512, 4 steps)")) {
+                    appState.numInferenceSteps = 4;
+                    appState.guidanceScale = 1.0f;
+                }
+                if (ImGui::Selectable("Quality (512x512, 8 steps)")) {
+                    appState.numInferenceSteps = 8;
+                    appState.guidanceScale = 1.0f;
+                }
             }
         } else {
             ImGui::Text("SD 1.5 Presets:");
@@ -804,7 +875,12 @@ void frame() {
         ImGui::BeginDisabled();
     }
     
-    std::string buttonText = (appState.modelType == 1) ? "Generate Image (FLUX)" : "Generate Image (SD 1.5)";
+    std::string buttonText;
+    if (appState.modelType == 1) {
+        buttonText = (appState.fluxVariant == 0) ? "Generate Image (FLUX-dev)" : "Generate Image (FLUX-schnell)";
+    } else {
+        buttonText = "Generate Image (SD 1.5)";
+    }
     if (ImGui::Button(buttonText.c_str(), ImVec2(-1, 40))) {
         // Start generation in background thread
         if (appState.generationThread != nullptr) {
