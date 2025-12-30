@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <fstream>
 #include <locale>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -56,7 +57,7 @@ void replace_all_chars(std::string& str, char target, char replacement) {
     }
 }
 
-std::string format(const char* fmt, ...) {
+std::string sd_format(const char* fmt, ...) {
     va_list ap;
     va_list ap2;
     va_start(ap, fmt);
@@ -94,23 +95,71 @@ bool is_directory(const std::string& path) {
     return (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY));
 }
 
-std::string get_full_path(const std::string& dir, const std::string& filename) {
-    std::string full_path = dir + "\\" + filename;
+class MmapWrapperImpl : public MmapWrapper {
+public:
+    MmapWrapperImpl(void* data, size_t size, HANDLE hfile, HANDLE hmapping)
+        : MmapWrapper(data, size), hfile_(hfile), hmapping_(hmapping) {}
 
-    WIN32_FIND_DATA find_file_data;
-    HANDLE hFind = FindFirstFile(full_path.c_str(), &find_file_data);
-
-    if (hFind != INVALID_HANDLE_VALUE) {
-        FindClose(hFind);
-        return full_path;
-    } else {
-        return "";
+    ~MmapWrapperImpl() override {
+        UnmapViewOfFile(data_);
+        CloseHandle(hmapping_);
+        CloseHandle(hfile_);
     }
+
+private:
+    HANDLE hfile_;
+    HANDLE hmapping_;
+};
+
+std::unique_ptr<MmapWrapper> MmapWrapper::create(const std::string& filename) {
+    void* mapped_data = nullptr;
+    size_t file_size  = 0;
+
+    HANDLE file_handle = CreateFileA(
+        filename.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL);
+
+    if (file_handle == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(file_handle, &size)) {
+        CloseHandle(file_handle);
+        return nullptr;
+    }
+
+    file_size = static_cast<size_t>(size.QuadPart);
+
+    HANDLE mapping_handle = CreateFileMapping(file_handle, NULL, PAGE_READONLY, 0, 0, NULL);
+
+    if (mapping_handle == NULL) {
+        CloseHandle(file_handle);
+        return nullptr;
+    }
+
+    mapped_data = MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, file_size);
+
+    if (mapped_data == NULL) {
+        CloseHandle(mapping_handle);
+        CloseHandle(file_handle);
+        return nullptr;
+    }
+
+    return std::make_unique<MmapWrapperImpl>(mapped_data, file_size, file_handle, mapping_handle);
 }
 
 #else  // Unix
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 bool file_exists(const std::string& filename) {
     struct stat buffer;
@@ -122,32 +171,68 @@ bool is_directory(const std::string& path) {
     return (stat(path.c_str(), &buffer) == 0 && S_ISDIR(buffer.st_mode));
 }
 
-// TODO: add windows version
-std::string get_full_path(const std::string& dir, const std::string& filename) {
-    DIR* dp = opendir(dir.c_str());
+class MmapWrapperImpl : public MmapWrapper {
+public:
+    MmapWrapperImpl(void* data, size_t size)
+        : MmapWrapper(data, size) {}
 
-    if (dp != nullptr) {
-        struct dirent* entry;
+    ~MmapWrapperImpl() override {
+        munmap(data_, size_);
+    }
+};
 
-        while ((entry = readdir(dp)) != nullptr) {
-            if (strcasecmp(entry->d_name, filename.c_str()) == 0) {
-                closedir(dp);
-                return dir + "/" + entry->d_name;
-            }
-        }
-
-        closedir(dp);
+std::unique_ptr<MmapWrapper> MmapWrapper::create(const std::string& filename) {
+    int file_descriptor = open(filename.c_str(), O_RDONLY);
+    if (file_descriptor == -1) {
+        return nullptr;
     }
 
-    return "";
+    int mmap_flags = MAP_PRIVATE;
+
+#ifdef __linux__
+    // performance flags used by llama.cpp
+    // posix_fadvise(file_descriptor, 0, 0, POSIX_FADV_SEQUENTIAL);
+    // mmap_flags |= MAP_POPULATE;
+#endif
+
+    struct stat sb;
+    if (fstat(file_descriptor, &sb) == -1) {
+        close(file_descriptor);
+        return nullptr;
+    }
+
+    size_t file_size = sb.st_size;
+
+    void* mapped_data = mmap(NULL, file_size, PROT_READ, mmap_flags, file_descriptor, 0);
+
+    close(file_descriptor);
+
+    if (mapped_data == MAP_FAILED) {
+        return nullptr;
+    }
+
+#ifdef __linux__
+    // performance flags used by llama.cpp
+    // posix_madvise(mapped_data, file_size, POSIX_MADV_WILLNEED);
+#endif
+
+    return std::make_unique<MmapWrapperImpl>(mapped_data, file_size);
 }
 
 #endif
 
+bool MmapWrapper::copy_data(void* buf, size_t n, size_t offset) const {
+    if (offset >= size_ || n > (size_ - offset)) {
+        return false;
+    }
+    std::memcpy(buf, data() + offset, n);
+    return true;
+}
+
 // get_num_physical_cores is copy from
 // https://github.com/ggerganov/llama.cpp/blob/master/examples/common.cpp
 // LICENSE: https://github.com/ggerganov/llama.cpp/blob/master/LICENSE
-int32_t get_num_physical_cores() {
+int32_t sd_get_num_physical_cores() {
 #ifdef __linux__
     // enumerate the set of thread siblings, num entries is num cores
     std::unordered_set<std::string> siblings;
@@ -184,6 +269,13 @@ int32_t get_num_physical_cores() {
 
 static sd_progress_cb_t sd_progress_cb = nullptr;
 void* sd_progress_cb_data              = nullptr;
+
+static sd_preview_cb_t sd_preview_cb = nullptr;
+static void* sd_preview_cb_data      = nullptr;
+preview_t sd_preview_mode            = PREVIEW_NONE;
+int sd_preview_interval              = 1;
+bool sd_preview_denoised             = true;
+bool sd_preview_noisy                = false;
 
 std::u32string utf8_to_utf32(const std::string& utf8_str) {
     std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> converter;
@@ -266,13 +358,16 @@ void pretty_progress(int step, int steps, float time) {
         }
     }
     progress += "|";
-    printf(time > 1.0f ? "\r%s %i/%i - %.2fs/it" : "\r%s %i/%i - %.2fit/s\033[K",
-           progress.c_str(), step, steps,
-           time > 1.0f || time == 0 ? time : (1.0f / time));
-    fflush(stdout);  // for linux
-    if (step == steps) {
-        printf("\n");
+
+    const char* lf   = (step == steps ? "\n" : "");
+    const char* unit = "s/it";
+    float speed      = time;
+    if (speed < 1.0f && speed > 0.f) {
+        speed = 1.0f / speed;
+        unit  = "it/s";
     }
+    printf("\r%s %i/%i - %.2f%s\033[K%s", progress.c_str(), step, steps, speed, unit, lf);
+    fflush(stdout);  // for linux
 }
 
 std::string ltrim(const std::string& s) {
@@ -328,23 +423,58 @@ void sd_set_progress_callback(sd_progress_cb_t cb, void* data) {
     sd_progress_cb      = cb;
     sd_progress_cb_data = data;
 }
+void sd_set_preview_callback(sd_preview_cb_t cb, preview_t mode, int interval, bool denoised, bool noisy, void* data) {
+    sd_preview_cb       = cb;
+    sd_preview_cb_data  = data;
+    sd_preview_mode     = mode;
+    sd_preview_interval = interval;
+    sd_preview_denoised = denoised;
+    sd_preview_noisy    = noisy;
+}
+
+sd_preview_cb_t sd_get_preview_callback() {
+    return sd_preview_cb;
+}
+void* sd_get_preview_callback_data() {
+    return sd_preview_cb_data;
+}
+
+preview_t sd_get_preview_mode() {
+    return sd_preview_mode;
+}
+int sd_get_preview_interval() {
+    return sd_preview_interval;
+}
+bool sd_should_preview_denoised() {
+    return sd_preview_denoised;
+}
+bool sd_should_preview_noisy() {
+    return sd_preview_noisy;
+}
+
+sd_progress_cb_t sd_get_progress_callback() {
+    return sd_progress_cb;
+}
+void* sd_get_progress_callback_data() {
+    return sd_progress_cb_data;
+}
 const char* sd_get_system_info() {
     static char buffer[1024];
     std::stringstream ss;
     ss << "System Info: \n";
-    ss << "    SSE3 = " << ggml_cpu_has_sse3() << std::endl;
-    ss << "    AVX = " << ggml_cpu_has_avx() << std::endl;
-    ss << "    AVX2 = " << ggml_cpu_has_avx2() << std::endl;
-    ss << "    AVX512 = " << ggml_cpu_has_avx512() << std::endl;
-    ss << "    AVX512_VBMI = " << ggml_cpu_has_avx512_vbmi() << std::endl;
-    ss << "    AVX512_VNNI = " << ggml_cpu_has_avx512_vnni() << std::endl;
-    ss << "    FMA = " << ggml_cpu_has_fma() << std::endl;
-    ss << "    NEON = " << ggml_cpu_has_neon() << std::endl;
-    ss << "    ARM_FMA = " << ggml_cpu_has_arm_fma() << std::endl;
-    ss << "    F16C = " << ggml_cpu_has_f16c() << std::endl;
-    ss << "    FP16_VA = " << ggml_cpu_has_fp16_va() << std::endl;
-    ss << "    WASM_SIMD = " << ggml_cpu_has_wasm_simd() << std::endl;
-    ss << "    VSX = " << ggml_cpu_has_vsx() << std::endl;
+    ss << "    SSE3 = " << ggml_cpu_has_sse3() << " | ";
+    ss << "    AVX = " << ggml_cpu_has_avx() << " | ";
+    ss << "    AVX2 = " << ggml_cpu_has_avx2() << " | ";
+    ss << "    AVX512 = " << ggml_cpu_has_avx512() << " | ";
+    ss << "    AVX512_VBMI = " << ggml_cpu_has_avx512_vbmi() << " | ";
+    ss << "    AVX512_VNNI = " << ggml_cpu_has_avx512_vnni() << " | ";
+    ss << "    FMA = " << ggml_cpu_has_fma() << " | ";
+    ss << "    NEON = " << ggml_cpu_has_neon() << " | ";
+    ss << "    ARM_FMA = " << ggml_cpu_has_arm_fma() << " | ";
+    ss << "    F16C = " << ggml_cpu_has_f16c() << " | ";
+    ss << "    FP16_VA = " << ggml_cpu_has_fp16_va() << " | ";
+    ss << "    WASM_SIMD = " << ggml_cpu_has_wasm_simd() << " | ";
+    ss << "    VSX = " << ggml_cpu_has_vsx() << " | ";
     snprintf(buffer, sizeof(buffer), "%s", ss.str().c_str());
     return buffer;
 }
@@ -510,6 +640,8 @@ sd_image_f32_t clip_preprocess(sd_image_f32_t image, int target_width, int targe
 //   (abc) - increases attention to abc by a multiplier of 1.1
 //   (abc:3.12) - increases attention to abc by a multiplier of 3.12
 //   [abc] - decreases attention to abc by a multiplier of 1.1
+//   BREAK - separates the prompt into conceptually distinct parts for sequential processing
+//   B - internal helper pattern; prevents 'B' in 'BREAK' from being consumed as normal text
 //   \( - literal character '('
 //   \[ - literal character '['
 //   \) - literal character ')'
@@ -545,7 +677,7 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
     float round_bracket_multiplier  = 1.1f;
     float square_bracket_multiplier = 1 / 1.1f;
 
-    std::regex re_attention(R"(\\\(|\\\)|\\\[|\\\]|\\\\|\\|\(|\[|:([+-]?[.\d]+)\)|\)|\]|[^\\()\[\]:]+|:)");
+    std::regex re_attention(R"(\\\(|\\\)|\\\[|\\\]|\\\\|\\|\(|\[|:([+-]?[.\d]+)\)|\)|\]|\bBREAK\b|[^\\()\[\]:B]+|:|\bB)");
     std::regex re_break(R"(\s*\bBREAK\b\s*)");
 
     auto multiply_range = [&](int start_position, float multiplier) {
@@ -554,7 +686,7 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
         }
     };
 
-    std::smatch m;
+    std::smatch m, m2;
     std::string remaining_text = text;
 
     while (std::regex_search(remaining_text, m, re_attention)) {
@@ -578,6 +710,8 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
             square_brackets.pop_back();
         } else if (text == "\\(") {
             res.push_back({text.substr(1), 1.0f});
+        } else if (std::regex_search(text, m2, re_break)) {
+            res.push_back({"BREAK", -1.0f});
         } else {
             res.push_back({text, 1.0f});
         }

@@ -15,6 +15,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "json.hpp"
+#include "ordered_map.hpp"
 #include "zip.h"
 
 #define SD_MAX_DIMS 5
@@ -26,6 +27,7 @@ enum SDVersion {
     VERSION_SD1_TINY_UNET,
     VERSION_SD2,
     VERSION_SD2_INPAINT,
+    VERSION_SD2_TINY_UNET,
     VERSION_SDXL,
     VERSION_SDXL_INPAINT,
     VERSION_SDXL_PIX2PIX,
@@ -41,6 +43,9 @@ enum SDVersion {
     VERSION_WAN2_2_I2V,
     VERSION_WAN2_2_TI2V,
     VERSION_QWEN_IMAGE,
+    VERSION_FLUX2,
+    VERSION_Z_IMAGE,
+    VERSION_OVIS_IMAGE,
     VERSION_COUNT,
 };
 
@@ -52,7 +57,7 @@ static inline bool sd_version_is_sd1(SDVersion version) {
 }
 
 static inline bool sd_version_is_sd2(SDVersion version) {
-    if (version == VERSION_SD2 || version == VERSION_SD2_INPAINT) {
+    if (version == VERSION_SD2 || version == VERSION_SD2_INPAINT || version == VERSION_SD2_TINY_UNET) {
         return true;
     }
     return false;
@@ -86,7 +91,15 @@ static inline bool sd_version_is_flux(SDVersion version) {
         version == VERSION_FLUX_FILL ||
         version == VERSION_FLUX_CONTROLS ||
         version == VERSION_FLEX_2 ||
+        version == VERSION_OVIS_IMAGE ||
         version == VERSION_CHROMA_RADIANCE) {
+        return true;
+    }
+    return false;
+}
+
+static inline bool sd_version_is_flux2(SDVersion version) {
+    if (version == VERSION_FLUX2) {
         return true;
     }
     return false;
@@ -106,8 +119,19 @@ static inline bool sd_version_is_qwen_image(SDVersion version) {
     return false;
 }
 
+static inline bool sd_version_is_z_image(SDVersion version) {
+    if (version == VERSION_Z_IMAGE) {
+        return true;
+    }
+    return false;
+}
+
 static inline bool sd_version_is_inpaint(SDVersion version) {
-    if (version == VERSION_SD1_INPAINT || version == VERSION_SD2_INPAINT || version == VERSION_SDXL_INPAINT || version == VERSION_FLUX_FILL || version == VERSION_FLEX_2) {
+    if (version == VERSION_SD1_INPAINT ||
+        version == VERSION_SD2_INPAINT ||
+        version == VERSION_SDXL_INPAINT ||
+        version == VERSION_FLUX_FILL ||
+        version == VERSION_FLEX_2) {
         return true;
     }
     return false;
@@ -115,9 +139,11 @@ static inline bool sd_version_is_inpaint(SDVersion version) {
 
 static inline bool sd_version_is_dit(SDVersion version) {
     if (sd_version_is_flux(version) ||
+        sd_version_is_flux2(version) ||
         sd_version_is_sd3(version) ||
         sd_version_is_wan(version) ||
-        sd_version_is_qwen_image(version)) {
+        sd_version_is_qwen_image(version) ||
+        sd_version_is_z_image(version)) {
         return true;
     }
     return false;
@@ -144,7 +170,6 @@ struct TensorStorage {
     std::string name;
     ggml_type type          = GGML_TYPE_F32;
     ggml_type expected_type = GGML_TYPE_COUNT;
-    bool is_bf16            = false;
     bool is_f8_e4m3         = false;
     bool is_f8_e5m2         = false;
     bool is_f64             = false;
@@ -178,7 +203,7 @@ struct TensorStorage {
     }
 
     int64_t nbytes_to_read() const {
-        if (is_bf16 || is_f8_e4m3 || is_f8_e5m2) {
+        if (is_f8_e4m3 || is_f8_e5m2) {
             return nbytes() / 2;
         } else if (is_f64 || is_i64) {
             return nbytes() * 2;
@@ -226,9 +251,7 @@ struct TensorStorage {
     std::string to_string() const {
         std::stringstream ss;
         const char* type_name = ggml_type_name(type);
-        if (is_bf16) {
-            type_name = "bf16";
-        } else if (is_f8_e4m3) {
+        if (is_f8_e4m3) {
             type_name = "f8_e4m3";
         } else if (is_f8_e5m2) {
             type_name = "f8_e5m2";
@@ -252,10 +275,11 @@ struct TensorStorage {
 
 typedef std::function<bool(const TensorStorage&, ggml_tensor**)> on_new_tensor_cb_t;
 
-typedef std::map<std::string, TensorStorage> String2TensorStorage;
+typedef OrderedMap<std::string, TensorStorage> String2TensorStorage;
 
 class ModelLoader {
 protected:
+    SDVersion version_ = VERSION_COUNT;
     std::vector<std::string> file_paths_;
     String2TensorStorage tensor_storage_map;
 
@@ -275,17 +299,22 @@ protected:
 
 public:
     bool init_from_file(const std::string& file_path, const std::string& prefix = "");
+    void convert_tensors_name();
+    bool init_from_file_and_convert_name(const std::string& file_path,
+                                         const std::string& prefix = "",
+                                         SDVersion version         = VERSION_COUNT);
     SDVersion get_sd_version();
     std::map<ggml_type, uint32_t> get_wtype_stat();
     std::map<ggml_type, uint32_t> get_conditioner_wtype_stat();
     std::map<ggml_type, uint32_t> get_diffusion_model_wtype_stat();
     std::map<ggml_type, uint32_t> get_vae_wtype_stat();
     String2TensorStorage& get_tensor_storage_map() { return tensor_storage_map; }
-    void set_wtype_override(ggml_type wtype, std::string prefix = "");
-    bool load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_threads = 0);
+    void set_wtype_override(ggml_type wtype, std::string tensor_type_rules = "");
+    bool load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_threads = 0, bool use_mmap = false);
     bool load_tensors(std::map<std::string, struct ggml_tensor*>& tensors,
                       std::set<std::string> ignore_tensors = {},
-                      int n_threads                        = 0);
+                      int n_threads                        = 0,
+                      bool use_mmap                        = false);
 
     std::vector<std::string> get_tensor_names() const {
         std::vector<std::string> names;
@@ -302,6 +331,8 @@ public:
 
     static std::string load_merges();
     static std::string load_qwen2_merges();
+    static std::string load_mistral_merges();
+    static std::string load_mistral_vocab_json();
     static std::string load_t5_tokenizer_json();
     static std::string load_umt5_tokenizer_json();
 };

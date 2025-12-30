@@ -28,7 +28,7 @@ public:
         if (vae_downsample) {
             auto conv = std::dynamic_pointer_cast<Conv2d>(blocks["conv"]);
 
-            x = ggml_pad(ctx->ggml_ctx, x, 1, 1, 0, 0);
+            x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
             x = conv->forward(ctx, x);
         } else {
             auto conv = std::dynamic_pointer_cast<Conv2d>(blocks["op"]);
@@ -182,31 +182,23 @@ protected:
     int64_t dim_in;
     int64_t dim_out;
 
-    void init_params(struct ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, std::string prefix = "") override {
-        enum ggml_type wtype      = get_type(prefix + "proj.weight", tensor_storage_map, GGML_TYPE_F32);
-        enum ggml_type bias_wtype = GGML_TYPE_F32;
-        params["proj.weight"]     = ggml_new_tensor_2d(ctx, wtype, dim_in, dim_out * 2);
-        params["proj.bias"]       = ggml_new_tensor_1d(ctx, bias_wtype, dim_out * 2);
-    }
-
 public:
     GEGLU(int64_t dim_in, int64_t dim_out)
-        : dim_in(dim_in), dim_out(dim_out) {}
+        : dim_in(dim_in), dim_out(dim_out) {
+        blocks["proj"] = std::shared_ptr<GGMLBlock>(new Linear(dim_in, dim_out * 2));
+    }
 
     struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* x) override {
         // x: [ne3, ne2, ne1, dim_in]
         // return: [ne3, ne2, ne1, dim_out]
-        struct ggml_tensor* w = params["proj.weight"];
-        struct ggml_tensor* b = params["proj.bias"];
+        auto proj = std::dynamic_pointer_cast<Linear>(blocks["proj"]);
 
-        auto x_w    = ggml_view_2d(ctx->ggml_ctx, w, w->ne[0], w->ne[1] / 2, w->nb[1], 0);                        // [dim_out, dim_in]
-        auto x_b    = ggml_view_1d(ctx->ggml_ctx, b, b->ne[0] / 2, 0);                                            // [dim_out, dim_in]
-        auto gate_w = ggml_view_2d(ctx->ggml_ctx, w, w->ne[0], w->ne[1] / 2, w->nb[1], w->nb[1] * w->ne[1] / 2);  // [dim_out, ]
-        auto gate_b = ggml_view_1d(ctx->ggml_ctx, b, b->ne[0] / 2, b->nb[0] * b->ne[0] / 2);                      // [dim_out, ]
+        x          = proj->forward(ctx, x);  // [ne3, ne2, ne1, dim_out*2]
+        auto x_vec = ggml_ext_chunk(ctx->ggml_ctx, x, 2, 0, false);
+        x          = x_vec[0];  // [ne3, ne2, ne1, dim_out]
+        auto gate  = x_vec[1];  // [ne3, ne2, ne1, dim_out]
 
-        auto x_in = x;
-        x         = ggml_ext_linear(ctx->ggml_ctx, x_in, x_w, x_b);        // [ne3, ne2, ne1, dim_out]
-        auto gate = ggml_ext_linear(ctx->ggml_ctx, x_in, gate_w, gate_b);  // [ne3, ne2, ne1, dim_out]
+        gate = ggml_cont(ctx->ggml_ctx, gate);
 
         gate = ggml_gelu_inplace(ctx->ggml_ctx, gate);
 
@@ -252,14 +244,18 @@ public:
         }
 
         // net_1 is nn.Dropout(), skip for inference
-        float scale = 1.f;
+        bool force_prec_f32 = false;
+        float scale         = 1.f;
         if (precision_fix) {
             scale = 1.f / 128.f;
+#ifdef SD_USE_VULKAN
+            force_prec_f32 = true;
+#endif
         }
         // The purpose of the scale here is to prevent NaN issues in certain situations.
         // For example, when using Vulkan without enabling force_prec_f32,
         // or when using CUDA but the weights are k-quants.
-        blocks["net.2"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, dim_out, true, false, false, scale));
+        blocks["net.2"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, dim_out, true, false, force_prec_f32, scale));
     }
 
     struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* x) {
@@ -409,6 +405,22 @@ protected:
     int64_t depth       = 1;    // 1
     int64_t context_dim = 768;  // hidden_size, 1024 for VERSION_SD2
     bool use_linear     = false;
+
+    void init_params(struct ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") {
+        auto iter = tensor_storage_map.find(prefix + "proj_out.weight");
+        if (iter != tensor_storage_map.end()) {
+            int64_t inner_dim = n_head * d_head;
+            if (iter->second.n_dims == 4 && use_linear) {
+                use_linear         = false;
+                blocks["proj_in"]  = std::make_shared<Conv2d>(in_channels, inner_dim, std::pair{1, 1});
+                blocks["proj_out"] = std::make_shared<Conv2d>(inner_dim, in_channels, std::pair{1, 1});
+            } else if (iter->second.n_dims == 2 && !use_linear) {
+                use_linear         = true;
+                blocks["proj_in"]  = std::make_shared<Linear>(in_channels, inner_dim);
+                blocks["proj_out"] = std::make_shared<Linear>(inner_dim, in_channels);
+            }
+        }
+    }
 
 public:
     SpatialTransformer(int64_t in_channels,

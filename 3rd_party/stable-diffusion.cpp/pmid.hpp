@@ -548,7 +548,7 @@ public:
         return gf;
     }
 
-    void compute(const int n_threads,
+    bool compute(const int n_threads,
                  struct ggml_tensor* id_pixel_values,
                  struct ggml_tensor* prompt_embeds,
                  struct ggml_tensor* id_embeds,
@@ -561,7 +561,7 @@ public:
         };
 
         // GGMLRunner::compute(get_graph, n_threads, updated_prompt_embeds);
-        GGMLRunner::compute(get_graph, n_threads, true, updated_prompt_embeds, output_ctx);
+        return GGMLRunner::compute(get_graph, n_threads, true, updated_prompt_embeds, output_ctx);
     }
 };
 
@@ -578,7 +578,7 @@ struct PhotoMakerIDEmbed : public GGMLRunner {
                       const std::string& file_path = "",
                       const std::string& prefix    = "")
         : file_path(file_path), GGMLRunner(backend, offload_params_to_cpu), model_loader(ml) {
-        if (!model_loader->init_from_file(file_path, prefix)) {
+        if (!model_loader->init_from_file_and_convert_name(file_path, prefix)) {
             load_failed = true;
         }
     }

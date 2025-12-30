@@ -820,7 +820,7 @@ struct T5Runner : public GGMLRunner {
         return gf;
     }
 
-    void compute(const int n_threads,
+    bool compute(const int n_threads,
                  struct ggml_tensor* input_ids,
                  struct ggml_tensor* attention_mask,
                  ggml_tensor** output,
@@ -828,7 +828,7 @@ struct T5Runner : public GGMLRunner {
         auto get_graph = [&]() -> struct ggml_cgraph* {
             return build_graph(input_ids, attention_mask);
         };
-        GGMLRunner::compute(get_graph, n_threads, true, output, output_ctx);
+        return GGMLRunner::compute(get_graph, n_threads, true, output, output_ctx);
     }
 
     static std::vector<int> _relative_position_bucket(const std::vector<int>& relative_position,
@@ -1004,7 +1004,7 @@ struct T5Embedder {
         ggml_type model_data_type = GGML_TYPE_F16;
 
         ModelLoader model_loader;
-        if (!model_loader.init_from_file(file_path)) {
+        if (!model_loader.init_from_file_and_convert_name(file_path)) {
             LOG_ERROR("init model loader from file failed: '%s'", file_path.c_str());
             return;
         }

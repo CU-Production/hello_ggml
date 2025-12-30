@@ -75,7 +75,7 @@ namespace WAN {
                 lp2 -= (int)cache_x->ne[2];
             }
 
-            x = ggml_pad_ext(ctx->ggml_ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0);
+            x = ggml_ext_pad_ext(ctx->ggml_ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
             return ggml_ext_conv_3d(ctx->ggml_ctx, x, w, b, in_channels,
                                     std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
                                     0, 0, 0,
@@ -206,9 +206,9 @@ namespace WAN {
                 } else if (mode == "upsample3d") {
                     x = ggml_upscale(ctx->ggml_ctx, x, 2, GGML_SCALE_MODE_NEAREST);
                 } else if (mode == "downsample2d") {
-                    x = ggml_pad(ctx->ggml_ctx, x, 1, 1, 0, 0);
+                    x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
                 } else if (mode == "downsample3d") {
-                    x = ggml_pad(ctx->ggml_ctx, x, 1, 1, 0, 0);
+                    x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
                 }
                 x = resample_1->forward(ctx, x);
                 x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));  // (c, t, h, w)
@@ -1133,7 +1133,7 @@ namespace WAN {
         }
 
         struct ggml_cgraph* build_graph(struct ggml_tensor* z, bool decode_graph) {
-            struct ggml_cgraph* gf = ggml_new_graph_custom(compute_ctx, 10240 * z->ne[2], false);
+            struct ggml_cgraph* gf = new_graph_custom(10240 * z->ne[2]);
 
             z = to_backend(z);
 
@@ -1147,7 +1147,7 @@ namespace WAN {
         }
 
         struct ggml_cgraph* build_graph_partial(struct ggml_tensor* z, bool decode_graph, int64_t i) {
-            struct ggml_cgraph* gf = ggml_new_graph_custom(compute_ctx, 20480, false);
+            struct ggml_cgraph* gf = new_graph_custom(20480);
 
             ae.clear_cache();
 
@@ -1175,7 +1175,7 @@ namespace WAN {
             return gf;
         }
 
-        void compute(const int n_threads,
+        bool compute(const int n_threads,
                      struct ggml_tensor* z,
                      bool decode_graph,
                      struct ggml_tensor** output,
@@ -1184,7 +1184,7 @@ namespace WAN {
                 auto get_graph = [&]() -> struct ggml_cgraph* {
                     return build_graph(z, decode_graph);
                 };
-                GGMLRunner::compute(get_graph, n_threads, true, output, output_ctx);
+                return GGMLRunner::compute(get_graph, n_threads, true, output, output_ctx);
             } else {  // chunk 1 result is weird
                 ae.clear_cache();
                 int64_t t      = z->ne[2];
@@ -1193,11 +1193,11 @@ namespace WAN {
                     return build_graph_partial(z, decode_graph, i);
                 };
                 struct ggml_tensor* out = nullptr;
-                GGMLRunner::compute(get_graph, n_threads, true, &out, output_ctx);
+                bool res                = GGMLRunner::compute(get_graph, n_threads, true, &out, output_ctx);
                 ae.clear_cache();
                 if (t == 1) {
                     *output = out;
-                    return;
+                    return res;
                 }
 
                 *output = ggml_new_tensor_4d(output_ctx, GGML_TYPE_F32, out->ne[0], out->ne[1], (t - 1) * 4 + 1, out->ne[3]);
@@ -1221,11 +1221,12 @@ namespace WAN {
                 out = ggml_new_tensor_4d(output_ctx, GGML_TYPE_F32, out->ne[0], out->ne[1], 4, out->ne[3]);
 
                 for (i = 1; i < t; i++) {
-                    GGMLRunner::compute(get_graph, n_threads, true, &out);
+                    res = res || GGMLRunner::compute(get_graph, n_threads, true, &out);
                     ae.clear_cache();
                     copy_to_output();
                 }
                 free_cache_ctx_and_buffer();
+                return res;
             }
         }
 
@@ -1271,7 +1272,7 @@ namespace WAN {
                 vae->get_param_tensors(tensors, "first_stage_model");
 
                 ModelLoader model_loader;
-                if (!model_loader.init_from_file(file_path, "vae.")) {
+                if (!model_loader.init_from_file_and_convert_name(file_path, "vae.")) {
                     LOG_ERROR("init model loader from file failed: '%s'", file_path.c_str());
                     return;
                 }
@@ -1825,7 +1826,7 @@ namespace WAN {
             }
         }
 
-        struct ggml_tensor* pad_to_patch_size(struct ggml_context* ctx,
+        struct ggml_tensor* pad_to_patch_size(GGMLRunnerContext* ctx,
                                               struct ggml_tensor* x) {
             int64_t W = x->ne[0];
             int64_t H = x->ne[1];
@@ -1834,8 +1835,7 @@ namespace WAN {
             int pad_t = (std::get<0>(params.patch_size) - T % std::get<0>(params.patch_size)) % std::get<0>(params.patch_size);
             int pad_h = (std::get<1>(params.patch_size) - H % std::get<1>(params.patch_size)) % std::get<1>(params.patch_size);
             int pad_w = (std::get<2>(params.patch_size) - W % std::get<2>(params.patch_size)) % std::get<2>(params.patch_size);
-            x         = ggml_pad(ctx, x, pad_w, pad_h, pad_t, 0);  // [N*C, T + pad_t, H + pad_h, W + pad_w]
-
+            ggml_ext_pad(ctx->ggml_ctx, x, pad_w, pad_h, pad_t, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
             return x;
         }
 
@@ -1985,14 +1985,14 @@ namespace WAN {
             int64_t T = x->ne[2];
             int64_t C = x->ne[3];
 
-            x = pad_to_patch_size(ctx->ggml_ctx, x);
+            x = pad_to_patch_size(ctx, x);
 
             int64_t t_len = ((T + (std::get<0>(params.patch_size) / 2)) / std::get<0>(params.patch_size));
             int64_t h_len = ((H + (std::get<1>(params.patch_size) / 2)) / std::get<1>(params.patch_size));
             int64_t w_len = ((W + (std::get<2>(params.patch_size) / 2)) / std::get<2>(params.patch_size));
 
             if (time_dim_concat != nullptr) {
-                time_dim_concat = pad_to_patch_size(ctx->ggml_ctx, time_dim_concat);
+                time_dim_concat = pad_to_patch_size(ctx, time_dim_concat);
                 x               = ggml_concat(ctx->ggml_ctx, x, time_dim_concat, 2);  // [N*C, (T+pad_t) + (T2+pad_t2), H + pad_h, W + pad_w]
                 t_len           = ((x->ne[2] + (std::get<0>(params.patch_size) / 2)) / std::get<0>(params.patch_size));
             }
@@ -2075,15 +2075,19 @@ namespace WAN {
                     wan_params.text_len  = 512;
                 } else {
                     if (wan_params.vace_layers > 0) {
-                        desc = "Wan2.1-VACE-1.3B";
+                        desc              = "Wan2.1-VACE-1.3B";
+                        wan_params.in_dim = 16;
+                    } else if (wan_params.model_type == "i2v") {
+                        desc              = "Wan2.1-I2V-1.3B";
+                        wan_params.in_dim = 36;
                     } else {
-                        desc = "Wan2.1-T2V-1.3B";
+                        desc              = "Wan2.1-T2V-1.3B";
+                        wan_params.in_dim = 16;
                     }
                     wan_params.dim       = 1536;
                     wan_params.eps       = 1e-06;
                     wan_params.ffn_dim   = 8960;
                     wan_params.freq_dim  = 256;
-                    wan_params.in_dim    = 16;
                     wan_params.num_heads = 12;
                     wan_params.out_dim   = 16;
                     wan_params.text_len  = 512;
@@ -2142,7 +2146,7 @@ namespace WAN {
                                         struct ggml_tensor* time_dim_concat = nullptr,
                                         struct ggml_tensor* vace_context    = nullptr,
                                         float vace_strength                 = 1.f) {
-            struct ggml_cgraph* gf = ggml_new_graph_custom(compute_ctx, WAN_GRAPH_SIZE, false);
+            struct ggml_cgraph* gf = new_graph_custom(WAN_GRAPH_SIZE);
 
             x               = to_backend(x);
             timesteps       = to_backend(timesteps);
@@ -2190,7 +2194,7 @@ namespace WAN {
             return gf;
         }
 
-        void compute(int n_threads,
+        bool compute(int n_threads,
                      struct ggml_tensor* x,
                      struct ggml_tensor* timesteps,
                      struct ggml_tensor* context,
@@ -2205,7 +2209,7 @@ namespace WAN {
                 return build_graph(x, timesteps, context, clip_fea, c_concat, time_dim_concat, vace_context, vace_strength);
             };
 
-            GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
         }
 
         void test() {
@@ -2255,7 +2259,7 @@ namespace WAN {
             LOG_INFO("loading from '%s'", file_path.c_str());
 
             ModelLoader model_loader;
-            if (!model_loader.init_from_file(file_path, "model.diffusion_model.")) {
+            if (!model_loader.init_from_file_and_convert_name(file_path, "model.diffusion_model.")) {
                 LOG_ERROR("init model loader from file failed: '%s'", file_path.c_str());
                 return;
             }

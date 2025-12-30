@@ -156,9 +156,10 @@ struct ESRGAN : public GGMLRunner {
 
     ESRGAN(ggml_backend_t backend,
            bool offload_params_to_cpu,
+           int tile_size                                  = 128,
            const String2TensorStorage& tensor_storage_map = {})
         : GGMLRunner(backend, offload_params_to_cpu) {
-        // rrdb_net will be created in load_from_file
+        this->tile_size = tile_size;
     }
 
     std::string get_desc() override {
@@ -169,7 +170,7 @@ struct ESRGAN : public GGMLRunner {
         LOG_INFO("loading esrgan from '%s'", file_path.c_str());
 
         ModelLoader model_loader;
-        if (!model_loader.init_from_file(file_path)) {
+        if (!model_loader.init_from_file_and_convert_name(file_path)) {
             LOG_ERROR("init esrgan model loader from file failed: '%s'", file_path.c_str());
             return false;
         }
@@ -344,7 +345,7 @@ struct ESRGAN : public GGMLRunner {
         if (!rrdb_net)
             return nullptr;
         constexpr int kGraphNodes = 1 << 16;  // 65k
-        struct ggml_cgraph* gf    = ggml_new_graph_custom(compute_ctx, kGraphNodes, /*grads*/ false);
+        struct ggml_cgraph* gf    = new_graph_custom(kGraphNodes);
         x                         = to_backend(x);
 
         auto runner_ctx         = get_context();
@@ -353,14 +354,14 @@ struct ESRGAN : public GGMLRunner {
         return gf;
     }
 
-    void compute(const int n_threads,
+    bool compute(const int n_threads,
                  struct ggml_tensor* x,
                  ggml_tensor** output,
                  ggml_context* output_ctx = nullptr) {
         auto get_graph = [&]() -> struct ggml_cgraph* {
             return build_graph(x);
         };
-        GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+        return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
     }
 };
 

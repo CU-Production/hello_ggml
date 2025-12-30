@@ -362,11 +362,11 @@ void generateImage() {
                     gen_params.sample_params.guidance.txt_cfg = cfg_scale;
                     
                     if (useFlux) {
-                        gen_params.sample_params.sample_method = EULER;
-                        gen_params.sample_params.scheduler = SIMPLE;
+                        gen_params.sample_params.sample_method = EULER_SAMPLE_METHOD;
+                        gen_params.sample_params.scheduler = SIMPLE_SCHEDULER;
                     } else {
                         gen_params.sample_params.sample_method = sd_get_default_sample_method(appState.sd_ctx);
-                        gen_params.sample_params.scheduler = DEFAULT;
+                        gen_params.sample_params.scheduler = DISCRETE_SCHEDULER;
                     }
                     
                     // Generate image
@@ -461,11 +461,11 @@ void generateImage() {
             gen_params.sample_params.guidance.txt_cfg = cfg_scale;
             
             if (useFlux) {
-                gen_params.sample_params.sample_method = EULER;
-                gen_params.sample_params.scheduler = SIMPLE;
+                gen_params.sample_params.sample_method = EULER_SAMPLE_METHOD;
+                gen_params.sample_params.scheduler = SIMPLE_SCHEDULER;
             } else {
                 gen_params.sample_params.sample_method = sd_get_default_sample_method(appState.sd_ctx);
-                gen_params.sample_params.scheduler = DEFAULT;
+                gen_params.sample_params.scheduler = DISCRETE_SCHEDULER;
             }
             
             sd_image_t* results = generate_image(appState.sd_ctx, &gen_params);

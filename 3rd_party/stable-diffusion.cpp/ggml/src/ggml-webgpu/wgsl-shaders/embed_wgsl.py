@@ -19,6 +19,15 @@ def parse_decls(decls_text):
     return decls
 
 
+def replace_repl_placeholders(variant, template_map):
+    for repl, code in variant["REPLS"].items():
+        for key, val in template_map.items():
+            # Match "key" and avoid matching subsequences using by using \b
+            code = re.sub(rf'\b{re.escape(str(key))}\b', str(val), code)
+        variant["REPLS"][repl] = code
+    return variant
+
+
 def replace_placeholders(shader_text, replacements):
     for key, val in replacements.items():
         # Match {{KEY}} literally, where KEY is escaped
@@ -71,10 +80,17 @@ def generate_variants(fname, input_dir, output_dir, outfile):
             decls_map = parse_decls(extract_block(text, "DECLS"))
         except ValueError:
             decls_map = {}
+        try:
+            templates_map = ast.literal_eval(extract_block(text, "REPL_TEMPLATES"))
+        except ValueError:
+            templates_map = {}
 
-        with open(os.path.join(input_dir, "common_decls.tmpl"), "r", encoding="utf-8") as f:
-            common_decls = f.read()
-        decls_map.update(parse_decls(common_decls))
+        for fname in sorted(os.listdir(input_dir)):
+            if fname.endswith(".tmpl"):
+                tmpl_path = os.path.join(input_dir, fname)
+                with open(tmpl_path, "r", encoding="utf-8") as f_tmpl:
+                    decls = f_tmpl.read()
+                    decls_map.update(parse_decls(decls))
 
         shader_template = extract_block(text, "SHADER")
         for variant in variants:
@@ -87,16 +103,23 @@ def generate_variants(fname, input_dir, output_dir, outfile):
                 if key not in decls_map:
                     raise ValueError(f"DECLS key '{key}' not found.")
                 decls_code += decls_map[key] + "\n\n"
-
-            shader_variant = replace_placeholders(shader_template, variant["REPLS"])
-            final_shader = re.sub(r'\bDECLS\b', decls_code, shader_variant)
+            final_shader = re.sub(r'\bDECLS\b', decls_code, shader_template)
+            if "REPLS" in variant:
+                variant = replace_repl_placeholders(variant, templates_map)
+                final_shader = replace_placeholders(final_shader, variant["REPLS"])
+                # second run to expand placeholders in repl_template
+                final_shader = replace_placeholders(final_shader, variant["REPLS"])
             final_shader = expand_includes(final_shader, input_dir)
 
-            if "SRC0_TYPE" in variant["REPLS"] and "SRC1_TYPE" in variant["REPLS"]:
+            if "SHADER_NAME" in variant:
+                output_name = variant["SHADER_NAME"]
+            elif "SHADER_SUFFIX" in variant:
+                output_name = f"{shader_base_name}_" + variant["SHADER_SUFFIX"]
+            elif "REPLS" in variant and "SRC0_TYPE" in variant["REPLS"] and "SRC1_TYPE" in variant["REPLS"]:
                 output_name = f"{shader_base_name}_" + "_".join([variant["REPLS"]["SRC0_TYPE"], variant["REPLS"]["SRC1_TYPE"]])
-            elif "TYPE_SUFFIX" in variant["REPLS"]:
-                output_name = f"{shader_base_name}_" + variant["REPLS"]["TYPE_SUFFIX"]
-            elif "TYPE" in variant["REPLS"]:
+            elif "REPLS" in variant and "SRC_TYPE" in variant["REPLS"] and "DST_TYPE" in variant["REPLS"]:
+                output_name = f"{shader_base_name}_" + "_".join([variant["REPLS"]["SRC_TYPE"], variant["REPLS"]["DST_TYPE"]])
+            elif "REPLS" in variant and "TYPE" in variant["REPLS"]:
                 output_name = f"{shader_base_name}_" + variant["REPLS"]["TYPE"]
             else:
                 output_name = shader_base_name

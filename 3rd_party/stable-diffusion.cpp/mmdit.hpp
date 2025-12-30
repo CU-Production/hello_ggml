@@ -101,10 +101,14 @@ protected:
 
 public:
     TimestepEmbedder(int64_t hidden_size,
-                     int64_t frequency_embedding_size = 256)
+                     int64_t frequency_embedding_size = 256,
+                     int64_t out_channels             = 0)
         : frequency_embedding_size(frequency_embedding_size) {
+        if (out_channels <= 0) {
+            out_channels = hidden_size;
+        }
         blocks["mlp.0"] = std::shared_ptr<GGMLBlock>(new Linear(frequency_embedding_size, hidden_size, true, true));
-        blocks["mlp.2"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, hidden_size, true, true));
+        blocks["mlp.2"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, out_channels, true, true));
     }
 
     struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* t) {
@@ -870,7 +874,7 @@ struct MMDiTRunner : public GGMLRunner {
                                     struct ggml_tensor* context,
                                     struct ggml_tensor* y,
                                     std::vector<int> skip_layers = std::vector<int>()) {
-        struct ggml_cgraph* gf = ggml_new_graph_custom(compute_ctx, MMDIT_GRAPH_SIZE, false);
+        struct ggml_cgraph* gf = new_graph_custom(MMDIT_GRAPH_SIZE);
 
         x         = to_backend(x);
         context   = to_backend(context);
@@ -890,7 +894,7 @@ struct MMDiTRunner : public GGMLRunner {
         return gf;
     }
 
-    void compute(int n_threads,
+    bool compute(int n_threads,
                  struct ggml_tensor* x,
                  struct ggml_tensor* timesteps,
                  struct ggml_tensor* context,
@@ -906,7 +910,7 @@ struct MMDiTRunner : public GGMLRunner {
             return build_graph(x, timesteps, context, y, skip_layers);
         };
 
-        GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+        return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
     }
 
     void test() {
@@ -961,7 +965,7 @@ struct MMDiTRunner : public GGMLRunner {
             mmdit->get_param_tensors(tensors, "model.diffusion_model");
 
             ModelLoader model_loader;
-            if (!model_loader.init_from_file(file_path)) {
+            if (!model_loader.init_from_file_and_convert_name(file_path)) {
                 LOG_ERROR("init model loader from file failed: '%s'", file_path.c_str());
                 return;
             }
