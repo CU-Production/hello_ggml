@@ -31,8 +31,9 @@ sg_pass_action pass_action{};
 // Global state for the application
 struct AppState {
     // UI inputs
-    char prompt[512] = "a photo of an astronaut riding a horse on mars";
-    char negativePrompt[512] = "";
+    // char prompt[512] = "a photo of an astronaut riding a horse on mars";
+    char prompt[1024] = "anime digital painting She sat poised on a ledge of polished peach quartz, the very image of a classical statue brought to wild, impish life within the sunlit cave dwellings. Her Korean features were framed by a stunning ginger hime cut, its straight, . A wild assembly of leather straps and sheer, iridescent fabric served as her lingerie, barely covering her slim figure while perfectly accentuating her narrow waist, tight ass, and breasts. The natural sunlight filtering through the cave's opening bathed her in a warm, rosy glow, making her pale skin seem to glow from within. One hand rested flat on the quartz beside her, supporting her lean, while the other was raised to her mouth, a single finger resting thoughtfully on her lower lip as she watched the dust motes dance in the light.";
+    char negativePrompt[1024] = "";
     int numInferenceSteps = 15;
     float guidanceScale = 7.5f;
     int nThreads = -1;  // -1 = auto-detect
@@ -1080,6 +1081,7 @@ int main(int argc, const char* argv[]) {
     desc.window_title = "Stable Diffusion Text to Image";
     desc.icon.sokol_default = true;
     desc.logger.func = slog_func;
+    desc.enable_clipboard = true;
     sapp_run(desc);
 
     return 0;
