@@ -44,7 +44,7 @@ struct AppState {
     bool realTimePreview = false;  // True real-time preview (VERY slow!)
     
     // Model selection
-    int modelType = 0;  // 0 = SD 1.5, 1 = FLUX
+    int modelType = 0;  // 0 = SD 1.5, 1 = FLUX, 2 = Z-Image
     int fluxVariant = 0;  // 0 = dev, 1 = schnell
     
     // SD 1.5 Model path
@@ -56,7 +56,12 @@ struct AppState {
     char fluxVae[512] = "E:/SW/ML/FLUX.1-dev/ae.sft";
     char fluxClipL[512] = "E:/SW/ML/flux_text_encoders/clip_l.safetensors";
     char fluxT5xxl[512] = "E:/SW/ML/flux_text_encoders/t5xxl_fp16.safetensors";
-    
+
+    // Z-Image Model paths
+    char zimageDiffusionModel[512] = "E:/SW/ML/Z-Image-Turbo-GGUF/z_image_turbo-Q8_0.gguf";
+    char zimageVae[512] = "E:/SW/ML/FLUX.1-dev/ae.sft";
+    char zimageLLM[512] = "E:/SW/ML/Qwen3-4B-Instruct-2507-GGUF/Qwen3-4B-Instruct-2507-UD-Q8_K_XL.gguf";
+
     // Generation state
     std::atomic<bool> isGenerating{false};
     std::atomic<bool> hasNewImage{false};
@@ -193,7 +198,9 @@ void generateImage() {
         
         bool useFlux;
         bool useSchnell;
+        bool useZImage;
         std::string fluxDiffusionModel, fluxVae, fluxClipL, fluxT5xxl;
+        std::string zimageDiffusionModel, zimageVae, zimageLLM;
         
         // Copy parameters from UI state
         {
@@ -202,6 +209,7 @@ void generateImage() {
             negativePrompt = std::string(appState.negativePrompt);
             modelPath = std::string(appState.modelPath);
             useFlux = (appState.modelType == 1);
+            useZImage = (appState.modelType == 2);
             useSchnell = (appState.fluxVariant == 1);
             
             // Select appropriate FLUX model based on variant
@@ -212,6 +220,13 @@ void generateImage() {
             fluxVae = std::string(appState.fluxVae);
             fluxClipL = std::string(appState.fluxClipL);
             fluxT5xxl = std::string(appState.fluxT5xxl);
+            
+            // Z-Image model paths
+            if (useZImage) {
+                zimageDiffusionModel = std::string(appState.zimageDiffusionModel);
+                zimageVae = std::string(appState.zimageVae);
+                zimageLLM = std::string(appState.zimageLLM);
+            }
             sample_steps = appState.numInferenceSteps;
             cfg_scale = appState.guidanceScale;
             n_threads = appState.nThreads;
@@ -231,12 +246,21 @@ void generateImage() {
         }
         
         // Check if model needs to be reloaded (first load or model type changed)
-        std::string currentModelType = useFlux ? (useSchnell ? "FLUX-schnell" : "FLUX-dev") : "SD15";
+        std::string currentModelType;
+        if (useZImage) {
+            currentModelType = "Z-Image";
+        } else if (useFlux) {
+            currentModelType = useSchnell ? "FLUX-schnell" : "FLUX-dev";
+        } else {
+            currentModelType = "SD15";
+        }
         bool needsReload = !appState.contextLoaded || appState.lastModelType != currentModelType;
         
         // Load model if needed
         if (needsReload) {
-            if (useFlux) {
+            if (useZImage) {
+                appState.statusMessage = "Loading Z-Image model...";
+            } else if (useFlux) {
                 appState.statusMessage = useSchnell ? "Loading FLUX-schnell model..." : "Loading FLUX-dev model...";
             } else {
                 appState.statusMessage = "Loading SD 1.5 model...";
@@ -256,7 +280,23 @@ void generateImage() {
             ctx_params.n_threads = n_threads;
             ctx_params.wtype = SD_TYPE_COUNT;  // Use default from model
             
-            if (useFlux) {
+            if (useZImage) {
+                // Z-Image configuration
+                ctx_params.diffusion_model_path = zimageDiffusionModel.c_str();
+                ctx_params.vae_path = zimageVae.c_str();
+                ctx_params.llm_path = zimageLLM.c_str();
+                ctx_params.vae_decode_only = false;
+                
+                // Memory optimization
+                ctx_params.keep_clip_on_cpu = false;
+                ctx_params.keep_vae_on_cpu = false;
+                ctx_params.offload_params_to_cpu = true;
+                
+                // Use CPU RNG for compatibility
+                ctx_params.rng_type = STD_DEFAULT_RNG;
+                ctx_params.free_params_immediately = false;
+                ctx_params.diffusion_flash_attn = true;  // Enable flash attention for better performance
+            } else if (useFlux) {
                 // FLUX configuration (based on successful CLI setup)
                 ctx_params.diffusion_model_path = fluxDiffusionModel.c_str();
                 ctx_params.vae_path = fluxVae.c_str();
@@ -362,7 +402,10 @@ void generateImage() {
                     gen_params.sample_params.sample_steps = current_steps;
                     gen_params.sample_params.guidance.txt_cfg = cfg_scale;
                     
-                    if (useFlux) {
+                    if (useZImage) {
+                        gen_params.sample_params.sample_method = EULER_SAMPLE_METHOD;
+                        gen_params.sample_params.scheduler = SIMPLE_SCHEDULER;
+                    } else if (useFlux) {
                         gen_params.sample_params.sample_method = EULER_SAMPLE_METHOD;
                         gen_params.sample_params.scheduler = SIMPLE_SCHEDULER;
                     } else {
@@ -461,7 +504,10 @@ void generateImage() {
             gen_params.sample_params.sample_steps = sample_steps;
             gen_params.sample_params.guidance.txt_cfg = cfg_scale;
             
-            if (useFlux) {
+            if (useZImage) {
+                gen_params.sample_params.sample_method = EULER_SAMPLE_METHOD;
+                gen_params.sample_params.scheduler = SIMPLE_SCHEDULER;
+            } else if (useFlux) {
                 gen_params.sample_params.sample_method = EULER_SAMPLE_METHOD;
                 gen_params.sample_params.scheduler = SIMPLE_SCHEDULER;
             } else {
@@ -623,7 +669,9 @@ void frame() {
     ImGui::SeparatorText("Generation Parameters");
     
     // Show recommended parameters based on model type
-    if (appState.modelType == 1) {
+    if (appState.modelType == 2) {
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Z-Image Recommended: 4 steps, CFG 1.0");
+    } else if (appState.modelType == 1) {
         if (appState.fluxVariant == 0) {
             ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "FLUX-dev Recommended: 20 steps, CFG 1.0");
         } else {
@@ -636,7 +684,10 @@ void frame() {
     // Quick apply recommended settings button
     ImGui::SameLine();
     if (ImGui::SmallButton("Apply Recommended")) {
-        if (appState.modelType == 1) {
+        if (appState.modelType == 2) {
+            appState.numInferenceSteps = 4;
+            appState.guidanceScale = 1.0f;
+        } else if (appState.modelType == 1) {
             if (appState.fluxVariant == 0) {
                 appState.numInferenceSteps = 20;
                 appState.guidanceScale = 1.0f;
@@ -714,6 +765,8 @@ void frame() {
     ImGui::RadioButton("Stable Diffusion 1.5", &appState.modelType, 0);
     ImGui::SameLine();
     ImGui::RadioButton("FLUX", &appState.modelType, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("Z-Image", &appState.modelType, 2);
     
     // FLUX variant selection (only shown when FLUX is selected)
     if (appState.modelType == 1) {
@@ -745,6 +798,52 @@ void frame() {
                 }
             }
             ImGui::TextWrapped("Single GGUF file for Stable Diffusion 1.5");
+            ImGui::TreePop();
+        }
+    } else if (appState.modelType == 2) {
+        // Z-Image Configuration
+        if (ImGui::TreeNode("Z-Image Model Paths (3 files required)")) {
+            ImGui::Text("Diffusion Model (GGUF):");
+            ImGui::InputText("##zimage_diff", appState.zimageDiffusionModel, sizeof(appState.zimageDiffusionModel));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Browse##zimage_diff")) {
+                nfdchar_t* outPath = nullptr;
+                nfdfilteritem_t filters[1] = {{"GGUF Models", "gguf"}};
+                nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+                if (result == NFD_OKAY) {
+                    strncpy(appState.zimageDiffusionModel, outPath, sizeof(appState.zimageDiffusionModel) - 1);
+                    NFD_FreePath(outPath);
+                }
+            }
+            
+            ImGui::Text("VAE (.sft):");
+            ImGui::InputText("##zimage_vae", appState.zimageVae, sizeof(appState.zimageVae));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Browse##zimage_vae")) {
+                nfdchar_t* outPath = nullptr;
+                nfdfilteritem_t filters[1] = {{"VAE Files", "sft"}};
+                nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+                if (result == NFD_OKAY) {
+                    strncpy(appState.zimageVae, outPath, sizeof(appState.zimageVae) - 1);
+                    NFD_FreePath(outPath);
+                }
+            }
+            
+            ImGui::Text("LLM - Qwen3-4B (GGUF):");
+            ImGui::InputText("##zimage_llm", appState.zimageLLM, sizeof(appState.zimageLLM));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Browse##zimage_llm")) {
+                nfdchar_t* outPath = nullptr;
+                nfdfilteritem_t filters[1] = {{"GGUF Models", "gguf"}};
+                nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+                if (result == NFD_OKAY) {
+                    strncpy(appState.zimageLLM, outPath, sizeof(appState.zimageLLM) - 1);
+                    NFD_FreePath(outPath);
+                }
+            }
+            
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Z-Image: ~8GB disk, 4GB+ VRAM, fast generation");
+            ImGui::TextWrapped("Z-Image uses Qwen3-4B as text encoder, similar to FLUX but more efficient.");
             ImGui::TreePop();
         }
     } else {
@@ -828,7 +927,21 @@ void frame() {
         ImGui::OpenPopup("preset_popup");
     }
     if (ImGui::BeginPopup("preset_popup")) {
-        if (appState.modelType == 1) {
+        if (appState.modelType == 2) {
+            ImGui::Text("Z-Image Presets:");
+            if (ImGui::Selectable("Ultra Fast (512x512, 2 steps)")) {
+                appState.numInferenceSteps = 2;
+                appState.guidanceScale = 1.0f;
+            }
+            if (ImGui::Selectable("Standard (512x512, 4 steps)")) {
+                appState.numInferenceSteps = 4;
+                appState.guidanceScale = 1.0f;
+            }
+            if (ImGui::Selectable("Quality (512x512, 8 steps)")) {
+                appState.numInferenceSteps = 8;
+                appState.guidanceScale = 1.0f;
+            }
+        } else if (appState.modelType == 1) {
             if (appState.fluxVariant == 0) {
                 ImGui::Text("FLUX-dev Presets:");
                 if (ImGui::Selectable("Fast (512x512, 15 steps)")) {
@@ -877,7 +990,9 @@ void frame() {
     }
     
     std::string buttonText;
-    if (appState.modelType == 1) {
+    if (appState.modelType == 2) {
+        buttonText = "Generate Image (Z-Image)";
+    } else if (appState.modelType == 1) {
         buttonText = (appState.fluxVariant == 0) ? "Generate Image (FLUX-dev)" : "Generate Image (FLUX-schnell)";
     } else {
         buttonText = "Generate Image (SD 1.5)";
